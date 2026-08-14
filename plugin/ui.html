@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <style>
+      body { font: 12px Inter, sans-serif; margin: 16px; color: #1e1e1e; }
+      #status { color: #666; line-height: 1.5; } .connected { color: #14804a !important; } .waiting { color: #8a5b00 !important; }
+    </style>
+  </head>
+  <body>
+    <div id="status">Connecting to your local Codex bridge…</div>
+    <script>
+      const status = document.getElementById("status");
+      function showStatus(message, kind = "") {
+        status.textContent = message;
+        status.className = kind;
+      }
+      window.onmessage = async (event) => {
+        const message = event.data.pluginMessage;
+        if (message?.type === "bridge-status") {
+          showStatus(message.message, message.kind);
+        }
+      };
+      parent.postMessage({ pluginMessage: { type: "start" } }, "*");
+    </script>
+  </body>
+</html>

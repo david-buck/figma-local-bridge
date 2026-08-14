@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "figma_local": {
+      "command": "node",
+      "args": ["./dist/server.mjs"]
+    }
+  }
+}

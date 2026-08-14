@@ -1,0 +1,13 @@
+{
+  "name": "Local MCP Bridge",
+  "id": "local-mcp-bridge-dev",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": ["figma"],
+  "documentAccess": "dynamic-page",
+  "networkAccess": {
+    "allowedDomains": ["http://localhost:3846"],
+    "reasoning": "Connects only to the user's locally running MCP bridge on localhost."
+  }
+}

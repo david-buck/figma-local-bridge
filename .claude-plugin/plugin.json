@@ -1,0 +1,10 @@
+{
+  "name": "figma-local-bridge",
+  "version": "0.9.1",
+  "description": "Inspect and edit the Figma Design file open in Figma Desktop through a local MCP bridge.",
+  "author": {
+    "name": "David Buck",
+    "url": "https://github.com/david-buck"
+  },
+  "mcpServers": "./.claude-mcp.json"
+}

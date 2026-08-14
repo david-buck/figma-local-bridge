@@ -1,0 +1,30 @@
+{
+  "name": "figma-local-bridge",
+  "version": "0.9.1",
+  "private": true,
+  "description": "Local-only MCP bridge for controlling the Figma Design file open in Figma Desktop.",
+  "homepage": "https://github.com/david-buck/figma-local-bridge#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/david-buck/figma-local-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/david-buck/figma-local-bridge/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "esbuild server.mjs --bundle --platform=node --format=esm --target=node20 --outfile=dist/server.mjs",
+    "check": "node --check server.mjs && node --check plugin/code.js && node --test test/server.test.mjs test/plugin-logic.test.mjs",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}
