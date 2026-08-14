@@ -13,7 +13,7 @@ const launchParentPid = process.ppid;
 const sessionFreshnessMs = 35_000;
 const replacedSessionRetentionMs = 5 * 60_000;
 const proxyHealthIntervalMs = 2_000;
-const bridgeVersion = "0.9.1";
+const bridgeVersion = "0.9.2";
 const exportDirectory = process.env.FIGMA_EXPORT_DIR ?? join(homedir(), "Pictures", "Figma MCP Exports");
 if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
   throw new Error("FIGMA_BRIDGE_PORT must be a valid TCP port.");

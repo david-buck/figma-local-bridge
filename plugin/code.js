@@ -2,7 +2,7 @@ figma.showUI(__html__, { width: 360, height: 250, title: "Local MCP Bridge" });
 
 let bridgeGeneration = 0;
 const bridgeUrl = "http://localhost:3846";
-const pluginVersion = "0.9.1";
+const pluginVersion = "0.9.2";
 const bridgeClientId = `figma-client-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const mutatingCommands = new Set([
   "moveResizeReparent", "updateText", "deleteNode", "duplicateNode",
@@ -97,7 +97,7 @@ async function startBridge() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ sessionId, clientId: bridgeClientId, info: bridgeContext() }),
       });
-      bridgeStatus(`Connected to Codex on “${figma.currentPage.name}”. Keep this plugin open.`, "connected");
+      bridgeStatus(`Connected to local MCP bridge on “${figma.currentPage.name}”. Keep this plugin open.`, "connected");
       while (generation === bridgeGeneration) {
         const message = await bridgeRequest(`/v1/poll${pollQuery(sessionId)}`);
         if (!message?.command || generation !== bridgeGeneration) continue;

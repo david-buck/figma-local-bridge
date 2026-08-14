@@ -1,6 +1,6 @@
 {
   "name": "figma-local-bridge",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "private": true,
   "description": "Local-only MCP bridge for controlling the Figma Design file open in Figma Desktop.",
   "homepage": "https://github.com/david-buck/figma-local-bridge#readme",
