@@ -84,9 +84,10 @@ function toolJson(result) {
 test("bridge advertises and orchestrates review and copy-sync workflows", async (context) => {
   const port = await freePort();
   const exportDirectory = await mkdtemp(join(tmpdir(), "figma-local-bridge-test-"));
+  const preferencesDirectory = await mkdtemp(join(tmpdir(), "figma-local-bridge-preferences-test-"));
   const child = spawn(process.execPath, [new URL("../server.mjs", import.meta.url).pathname], {
     cwd: new URL("../..", import.meta.url).pathname,
-    env: { ...process.env, FIGMA_BRIDGE_PORT: String(port), FIGMA_EXPORT_DIR: exportDirectory },
+    env: { ...process.env, FIGMA_BRIDGE_PORT: String(port), FIGMA_EXPORT_DIR: exportDirectory, FIGMA_PREFERENCES_DIR: preferencesDirectory },
     stdio: ["pipe", "pipe", "pipe"],
   });
   let stderr = "";
@@ -102,6 +103,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
       if (child.exitCode === null) child.kill("SIGTERM");
     }
     await rm(exportDirectory, { recursive: true, force: true });
+    await rm(preferencesDirectory, { recursive: true, force: true });
   });
 
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -117,7 +119,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     capabilities: {},
     clientInfo: { name: "figma-bridge-test", version: "1.0.0" },
   });
-  assert.equal(initialized.serverInfo.version, "0.9.2");
+  assert.equal(initialized.serverInfo.version, "0.10.0");
   assert.match(initialized.instructions, /figma_prepare_review/);
   assert.match(initialized.instructions, /figma_apply_copy_updates/);
   rpc.notify("notifications/initialized");
@@ -127,10 +129,55 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
   for (const name of [
     "figma_prepare_review", "figma_read_copy", "figma_apply_copy_updates", "figma_set_text_frame", "figma_split_text_block",
     "figma_archive_nodes", "figma_supersede_layout", "figma_compose_frame", "figma_copy_style_from_node", "figma_list_page_tokens", "figma_copy_image_fill", "figma_place_local_image",
+    "figma_get_user_preferences", "figma_set_user_preference", "figma_delete_user_preference", "figma_revert_user_preferences", "figma_resolve_design_choice",
+    "figma_list_design_system_assets", "figma_create_component_instance", "figma_apply_design_style",
   ]) {
     assert.ok(toolNames.has(name), `${name} should be advertised`);
   }
   assert.equal(toolJson(await rpc.request("tools/call", { name: "figma_bridge_status", arguments: {} })).connected, false);
+
+  const initialPreferences = toolJson(await rpc.request("tools/call", { name: "figma_get_user_preferences", arguments: {} }));
+  assert.equal(initialPreferences.revision, 0);
+  assert.equal(initialPreferences.count, 0);
+  const savedPreference = toolJson(await rpc.request("tools/call", {
+    name: "figma_set_user_preference",
+    arguments: {
+      confirmed: true, expectedRevision: 0, designSystem: "SBS", category: "component",
+      rule: "Prefer the compact SBS card for brochure summaries.", scope: { documentType: "brochure" },
+      asset: { role: "summary card", componentKey: "sbs-compact-card", componentName: "Compact card" },
+    },
+  }));
+  assert.equal(savedPreference.revision, 1);
+  const stalePreferenceWrite = await rpc.request("tools/call", {
+    name: "figma_set_user_preference",
+    arguments: { confirmed: true, expectedRevision: 0, designSystem: "Xero", category: "general", rule: "This stale write must not land." },
+  });
+  assert.equal(stalePreferenceWrite.isError, true);
+  assert.match(stalePreferenceWrite.content[0].text, /revision changed/i);
+  const resolvedChoice = toolJson(await rpc.request("tools/call", {
+    name: "figma_resolve_design_choice",
+    arguments: {
+      intent: "summary card", documentType: "brochure",
+      candidates: [
+        { candidateId: "sbs", designSystem: "SBS", assetType: "component", name: "Compact card", role: "summary card", key: "sbs-compact-card" },
+        { candidateId: "xero", designSystem: "Xero", assetType: "component", name: "Summary card", role: "summary card", key: "xero-summary-card" },
+      ],
+    },
+  }));
+  assert.equal(resolvedChoice.resolved, true);
+  assert.equal(resolvedChoice.selected.candidateId, "sbs");
+  const tiedChoice = toolJson(await rpc.request("tools/call", {
+    name: "figma_resolve_design_choice",
+    arguments: {
+      intent: "primary action",
+      candidates: [
+        { candidateId: "a", designSystem: "Alpha", assetType: "component", name: "Button" },
+        { candidateId: "b", designSystem: "Beta", assetType: "component", name: "Button" },
+      ],
+    },
+  }));
+  assert.equal(tiedChoice.needsClarification, true);
+  assert.equal(tiedChoice.resolved, false);
 
   const denied = await fetch(`${baseUrl}/v1/connect`, {
     method: "OPTIONS",
@@ -152,7 +199,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
 
   const proxyChild = spawn(process.execPath, [new URL("../server.mjs", import.meta.url).pathname], {
     cwd: new URL("../..", import.meta.url).pathname,
-    env: { ...process.env, FIGMA_BRIDGE_PORT: String(port), FIGMA_EXPORT_DIR: exportDirectory },
+    env: { ...process.env, FIGMA_BRIDGE_PORT: String(port), FIGMA_EXPORT_DIR: exportDirectory, FIGMA_PREFERENCES_DIR: preferencesDirectory },
     stdio: ["pipe", "pipe", "pipe"],
   });
   let proxyStderr = "";
@@ -174,7 +221,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     capabilities: {},
     clientInfo: { name: "figma-bridge-proxy-test", version: "1.0.0" },
   });
-  assert.equal(proxyInitialized.serverInfo.version, "0.9.2");
+  assert.equal(proxyInitialized.serverInfo.version, "0.10.0");
   proxyRpc.notify("notifications/initialized");
   const proxyStatus = toolJson(await proxyRpc.request("tools/call", { name: "figma_bridge_status", arguments: {} }));
   assert.equal(proxyStatus.connected, true);

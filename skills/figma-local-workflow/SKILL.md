@@ -1,6 +1,6 @@
 ---
 name: figma-local-workflow
-description: Use the local figma_local MCP bridge to inspect, analyse, edit, copy-sync, re-layout, compose, archive, style, add approved images to, or export the Figma Design file currently open in Figma Desktop. Trigger for requests to review artboards or spreads, sync external source copy such as Fieldwerk, read or revise copy, inspect or replace layouts, inherit page styles/tokens, audit text overflow, export frame PNGs, or make controlled canvas changes through the Local MCP Bridge plugin.
+description: Use the local figma_local MCP bridge to inspect, analyse, edit, copy-sync, re-layout, compose, archive, style, use design-system components and confirmed user preferences, add approved images to, or export the Figma Design file currently open in Figma Desktop. Trigger for requests to review artboards or spreads, sync external source copy such as Fieldwerk, read or revise copy, inspect or replace layouts, use linked components/styles/tokens, audit text overflow, export frame PNGs, or make controlled canvas changes through the Local MCP Bridge plugin.
 ---
 
 # Local Figma workflow
@@ -10,15 +10,16 @@ Use an inspect-first sequence. Do not begin by querying arbitrary page nodes or 
 ## Required sequence
 
 1. Call `figma_bridge_status`. Continue only when exactly one plugin is connected, and use its reported page name to confirm the expected Figma context.
-2. Call `figma_list_artboards` to discover stable artboard IDs and page order. Never guess IDs. If the relevant artboard is absent, call `figma_list_pages`, navigate with `figma_navigate_to_page`, then list artboards again.
-3. Identify the relevant artboard or page pair:
+2. Call `figma_get_user_preferences` before choosing components, styles, tokens, typography, layout conventions, or copy patterns. Treat only returned confirmed preferences as durable user guidance.
+3. Call `figma_list_design_system_assets`, then `figma_list_artboards`. Discover verified component/style/token candidates and stable artboard IDs; never guess IDs or recreate an appropriate available component. If the relevant artboard is absent, call `figma_list_pages`, navigate with `figma_navigate_to_page`, then repeat discovery.
+4. Identify the relevant artboard or page pair:
    - Call `figma_read_frame_content` with `detail: summary` for one artboard.
    - Call `figma_read_spread_content` with `detail: summary` for a spread, passing `nodeIds` in the order returned by `figma_list_artboards`.
    - Request `detail: full` only when hierarchy or hidden variants are needed.
-4. Call `figma_export_frame_png` for each relevant artboard and inspect the returned local PNG path. Use the visual together with the structured copy; neither is sufficient alone.
-5. Analyse copy and layout before proposing or making changes. Call `figma_audit_text_overflow` when text fit, truncation, clipping, or typography may matter.
-6. Only then edit identified nodes. Prefer the narrowest appropriate mutation tool and preserve unrelated content.
-7. Verify after editing:
+5. Call `figma_export_frame_png` for each relevant artboard and inspect the returned local PNG path. Use the visual together with the structured copy; neither is sufficient alone.
+6. Analyse copy and layout before proposing or making changes. Call `figma_audit_text_overflow` when text fit, truncation, clipping, or typography may matter.
+7. Only then edit identified nodes. Prefer the narrowest appropriate mutation tool and preserve unrelated content.
+8. Verify after editing:
    - Re-read affected frame or spread content.
    - Re-run the overflow audit when text or dimensions changed.
    - Re-export the affected artboard PNG and inspect it.
@@ -26,6 +27,19 @@ Use an inspect-first sequence. Do not begin by querying arbitrary page nodes or 
 ## Fast review path
 
 After artboard discovery, prefer `figma_prepare_review` when reviewing one to eight known artboards. It performs the read, local PNG exports, and optional overflow audits in that order without editing. Inspect every returned PNG before analysis. Use the individual tools when only one result is needed or when diagnosing a failed step.
+
+## Design-system preferences and tie-breaks
+
+Treat the bridge preference store as explicit per-user memory, not automatic learning.
+
+- Query it with `figma_get_user_preferences`. The user may ask in natural language what is known, why a choice is preferred, or which scope it applies to; answer from the returned records.
+- Prefer assets in this order: a confirmed scoped user choice; an appropriate linked-system component already used in the file; another verified component instance; a named style or bound variable; a verified source-node style; raw construction only when none applies.
+- Use `figma_create_component_instance` for a verified component ID/key and `figma_apply_design_style` for a verified style ID/key. Preserve component linkage and variables instead of detaching or copying raw values.
+- When two or more systems or assets remain equally plausible, call `figma_resolve_design_choice`. If it returns `needsClarification: true`, make no edit and ask the returned question with a concise candidate list. Never settle the tie from visual similarity, current selection, or library order.
+- After the user answers a tie, use that choice for the current task. Offer to save it with an appropriate project, document-type, or context scope; do not save unless the user explicitly confirms.
+- Create or update a record with `figma_set_user_preference` only from explicit user guidance. Read first and pass `expectedRevision`. Use the same revision guard for delete or revert operations.
+- Do not convert a one-off canvas choice into an ongoing preference. Do not silently infer taste from existing documents, generated layouts, or repeated tool calls.
+- A linked library must already be enabled by the user in the Figma file. If an expected library is unavailable, explain that boundary rather than approximating its assets.
 
 ## Delegated copy preparation
 
@@ -59,7 +73,7 @@ If a mutation batch times out, do not retry it immediately. Reconnect the plugin
 Use this deterministic flow when replacing an existing brochure page or artboard layout:
 
 1. Confirm the bridge/page, list artboards, read the exact target with `detail: summary`, and export its current PNG before changing anything.
-2. Call `figma_list_page_tokens` to discover verified local variables, styles, colours, and fonts. Use `figma_copy_style_from_node` when a known source node is the clearest brand reference. Never approximate a value already present in the file.
+2. Use `figma_list_design_system_assets` and `figma_list_page_tokens` to discover verified components, variables, styles, colours, and fonts. Prefer an appropriate component instance or named style; use `figma_copy_style_from_node` when a known source node is the clearest brand reference. Never approximate a value already present in the file.
 3. Define one clearly named replacement frame. Call `figma_compose_frame` with ordered frame/rectangle/text elements; use styled spans for mixed emphasis inside one text layer. Keep keys unique and declare parent elements before their children.
 4. Prefer supplying explicit previous sibling IDs in `archiveNodeIds`. The composer must build successfully before it groups those nodes into the hidden named archive. If composition and archiving are separate, verify the replacement first, then call `figma_supersede_layout` or `figma_archive_nodes` with the replacement ID.
 5. Inspect the compact audit and local PNG returned by the composer. If verification is incomplete, preserve the previous layout and diagnose before retrying. Use a full read only when the summary lacks necessary hierarchy.
@@ -73,6 +87,7 @@ Use this deterministic flow when replacing an existing brochure page or artboard
 - Treat `copy` as effectively visible text. Check `allCopy`, `hiddenTextCount`, and each text item's `effectiveVisible` value when hidden variants or conditional content matter.
 - Preserve the underlying copy's natural character case. Express uppercase, lowercase, title case or small caps through Figma typography (`textCase` on the text layer or styled span) instead of rewriting the stored characters. Only change the characters themselves when the source copy or user explicitly requires different casing; this keeps editing, accessibility, search and later restyling intact.
 - Treat emphasis, case, decoration, line height, letter spacing, font family/style, and size as typography—not copy. Prefer verified Figma text styles, `figma_copy_style_from_node`, or styled-span options over manually altering characters or splitting text into extra layers.
+- Preserve design-system linkage. Prefer `figma_create_component_instance`, `figma_apply_design_style`, and bound variables over detached copies or hand-built imitations.
 - Use `figma_update_text` only for an identified text node. Use structural tools only after inspecting hierarchy and bounds.
 - Make small, reversible batches and verify each batch before continuing.
 - For copy-only work, overwrite the existing visible text layers. Do not create duplicate layouts, hide existing layers, or reduce old nodes to zero opacity. Use replacement/archival only for an explicitly requested layout change, and state the result clearly.

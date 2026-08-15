@@ -6917,7 +6917,7 @@ var require_dist = __commonJS({
 // server.mjs
 import http from "node:http";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
@@ -31013,8 +31013,11 @@ var launchParentPid = process.ppid;
 var sessionFreshnessMs = 35e3;
 var replacedSessionRetentionMs = 5 * 6e4;
 var proxyHealthIntervalMs = 2e3;
-var bridgeVersion = "0.9.2";
+var bridgeVersion = "0.10.0";
 var exportDirectory = process.env.FIGMA_EXPORT_DIR ?? join(homedir(), "Pictures", "Figma MCP Exports");
+var preferencesDirectory = process.env.FIGMA_PREFERENCES_DIR ?? join(homedir(), ".figma-local-bridge");
+var preferencesPath = join(preferencesDirectory, "preferences.json");
+var preferencesLockPath = join(preferencesDirectory, "preferences.lock");
 if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
   throw new Error("FIGMA_BRIDGE_PORT must be a valid TCP port.");
 }
@@ -31536,19 +31539,283 @@ var composeFrameElement = external_exports.discriminatedUnion("type", [
     spans: external_exports.array(styledSpan).max(100).default([])
   })
 ]);
+var preferenceCategory = external_exports.enum(["component", "style", "token", "typography", "layout", "copy", "asset", "general"]);
+var preferenceScope = external_exports.object({
+  project: external_exports.string().trim().min(1).max(200).optional(),
+  documentType: external_exports.string().trim().min(1).max(200).optional(),
+  context: external_exports.string().trim().min(1).max(300).optional()
+});
+var preferenceAsset = external_exports.object({
+  role: external_exports.string().trim().min(1).max(200).optional(),
+  componentId: nodeId.optional(),
+  componentKey: external_exports.string().trim().min(1).max(300).optional(),
+  componentName: external_exports.string().trim().min(1).max(300).optional(),
+  styleId: nodeId.optional(),
+  styleKey: external_exports.string().trim().min(1).max(300).optional(),
+  styleName: external_exports.string().trim().min(1).max(300).optional(),
+  tokenId: tokenId.optional(),
+  tokenName: external_exports.string().trim().min(1).max(300).optional(),
+  variantProperties: external_exports.record(external_exports.string(), external_exports.union([external_exports.string(), external_exports.boolean()])).optional()
+});
+var storedPreference = external_exports.object({
+  id: external_exports.string().uuid(),
+  designSystem: external_exports.string().trim().min(1).max(300),
+  category: preferenceCategory,
+  rule: external_exports.string().trim().min(1).max(2e3),
+  scope: preferenceScope,
+  asset: preferenceAsset.optional(),
+  rationale: external_exports.string().trim().min(1).max(1e3).optional(),
+  source: external_exports.string().trim().min(1).max(500),
+  status: external_exports.literal("confirmed"),
+  createdAt: external_exports.string().datetime(),
+  updatedAt: external_exports.string().datetime()
+});
+var preferenceHistoryEntry = external_exports.object({
+  revision: external_exports.number().int().min(1),
+  previousRevision: external_exports.number().int().min(0),
+  changedAt: external_exports.string().datetime(),
+  action: external_exports.enum(["create", "update", "delete", "revert"]),
+  preferenceId: external_exports.string().uuid().nullable(),
+  preferences: external_exports.array(storedPreference).max(1e3)
+});
+var preferenceStore = external_exports.object({
+  schemaVersion: external_exports.literal(1),
+  revision: external_exports.number().int().min(0),
+  updatedAt: external_exports.string().datetime().nullable(),
+  preferences: external_exports.array(storedPreference).max(1e3),
+  history: external_exports.array(preferenceHistoryEntry).max(50)
+});
+function emptyPreferenceStore() {
+  return { schemaVersion: 1, revision: 0, updatedAt: null, preferences: [], history: [] };
+}
+async function readPreferenceStore() {
+  let contents;
+  try {
+    contents = await readFile(preferencesPath, "utf8");
+  } catch (error51) {
+    if (error51?.code === "ENOENT") return emptyPreferenceStore();
+    throw error51;
+  }
+  try {
+    return preferenceStore.parse(JSON.parse(contents));
+  } catch (error51) {
+    throw new Error(`The local preference file is invalid and was not changed: ${preferencesPath}. ${error51 instanceof Error ? error51.message : String(error51)}`);
+  }
+}
+async function writePreferenceStore(store) {
+  await mkdir(preferencesDirectory, { recursive: true, mode: 448 });
+  const temporaryPath = join(preferencesDirectory, `preferences.${process.pid}.${randomUUID()}.tmp`);
+  await writeFile(temporaryPath, `${JSON.stringify(preferenceStore.parse(store), null, 2)}
+`, { mode: 384 });
+  await rename(temporaryPath, preferencesPath);
+}
+async function withPreferenceLock(callback) {
+  await mkdir(preferencesDirectory, { recursive: true, mode: 448 });
+  let handle;
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    try {
+      handle = await open(preferencesLockPath, "wx", 384);
+      await handle.writeFile(`${process.pid} ${Date.now()}
+`);
+      break;
+    } catch (error51) {
+      if (error51?.code !== "EEXIST") throw error51;
+      try {
+        const lockStatus = await stat(preferencesLockPath);
+        if (Date.now() - lockStatus.mtimeMs > 15e3) await unlink(preferencesLockPath);
+      } catch (lockError) {
+        if (lockError?.code !== "ENOENT") throw lockError;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  if (!handle) throw new Error("The user-preference store is busy. Re-read preferences and try again.");
+  try {
+    return await callback();
+  } finally {
+    await handle.close().catch(() => {
+    });
+    await unlink(preferencesLockPath).catch(() => {
+    });
+  }
+}
+function assertPreferenceRevision(store, expectedRevision) {
+  if (store.revision !== expectedRevision) {
+    throw new Error(`Preference revision changed from ${expectedRevision} to ${store.revision}. Call figma_get_user_preferences again before updating.`);
+  }
+}
+function preferenceSummary(item) {
+  const scope = [item.scope.project, item.scope.documentType, item.scope.context].filter(Boolean);
+  const role = item.asset?.role ? ` (${item.asset.role})` : "";
+  return `${item.designSystem} \xB7 ${item.category}${role}${scope.length ? ` \xB7 ${scope.join(" / ")}` : ""}: ${item.rule}`;
+}
+function filteredPreferences(store, input) {
+  const query = input.query?.toLowerCase();
+  return store.preferences.filter((item) => {
+    if (input.designSystem && item.designSystem.toLowerCase() !== input.designSystem.toLowerCase()) return false;
+    if (input.category && item.category !== input.category) return false;
+    if (!query) return true;
+    return JSON.stringify(item).toLowerCase().includes(query);
+  });
+}
+async function getUserPreferences(input) {
+  const store = await readPreferenceStore();
+  const preferences = filteredPreferences(store, input);
+  return {
+    schemaVersion: store.schemaVersion,
+    revision: store.revision,
+    updatedAt: store.updatedAt,
+    storagePath: preferencesPath,
+    count: preferences.length,
+    summary: preferences.map(preferenceSummary),
+    preferences,
+    ...input.includeHistory ? { history: store.history.map(({ preferences: _snapshot, ...entry }) => entry) } : {}
+  };
+}
+function nextPreferenceStore(store, preferences, action, preferenceId) {
+  const changedAt = (/* @__PURE__ */ new Date()).toISOString();
+  const revision = store.revision + 1;
+  const history = [...store.history, {
+    revision,
+    previousRevision: store.revision,
+    changedAt,
+    action,
+    preferenceId,
+    preferences
+  }].slice(-50);
+  return { schemaVersion: 1, revision, updatedAt: changedAt, preferences, history };
+}
+async function setUserPreference(input) {
+  return withPreferenceLock(async () => {
+    const store = await readPreferenceStore();
+    assertPreferenceRevision(store, input.expectedRevision);
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const existingIndex = input.preferenceId ? store.preferences.findIndex((item) => item.id === input.preferenceId) : -1;
+    if (input.preferenceId && existingIndex < 0) throw new Error(`Preference ${input.preferenceId} was not found. Re-read preferences before updating.`);
+    const existing = existingIndex >= 0 ? store.preferences[existingIndex] : null;
+    const preference = storedPreference.parse({
+      id: existing?.id ?? randomUUID(),
+      designSystem: input.designSystem,
+      category: input.category,
+      rule: input.rule,
+      scope: input.scope,
+      ...input.asset ? { asset: input.asset } : {},
+      ...input.rationale ? { rationale: input.rationale } : {},
+      source: input.source,
+      status: "confirmed",
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now
+    });
+    const preferences = [...store.preferences];
+    if (existingIndex >= 0) preferences[existingIndex] = preference;
+    else preferences.push(preference);
+    const next = nextPreferenceStore(store, preferences, existing ? "update" : "create", preference.id);
+    await writePreferenceStore(next);
+    return { revision: next.revision, updatedAt: next.updatedAt, storagePath: preferencesPath, preference, summary: preferenceSummary(preference) };
+  });
+}
+async function deleteUserPreference(input) {
+  return withPreferenceLock(async () => {
+    const store = await readPreferenceStore();
+    assertPreferenceRevision(store, input.expectedRevision);
+    const deleted = store.preferences.find((item) => item.id === input.preferenceId);
+    if (!deleted) throw new Error(`Preference ${input.preferenceId} was not found. Re-read preferences before deleting.`);
+    const next = nextPreferenceStore(store, store.preferences.filter((item) => item.id !== input.preferenceId), "delete", input.preferenceId);
+    await writePreferenceStore(next);
+    return { revision: next.revision, updatedAt: next.updatedAt, storagePath: preferencesPath, deleted, remainingCount: next.preferences.length };
+  });
+}
+async function revertUserPreferences(input) {
+  return withPreferenceLock(async () => {
+    const store = await readPreferenceStore();
+    assertPreferenceRevision(store, input.expectedRevision);
+    const targetPreferences = input.targetRevision === 0 ? [] : store.history.find((entry) => entry.revision === input.targetRevision)?.preferences;
+    if (!targetPreferences) throw new Error(`Preference revision ${input.targetRevision} is not retained in local history.`);
+    const next = nextPreferenceStore(store, structuredClone(targetPreferences), "revert", null);
+    await writePreferenceStore(next);
+    return { revision: next.revision, revertedToRevision: input.targetRevision, updatedAt: next.updatedAt, storagePath: preferencesPath, count: next.preferences.length, summary: next.preferences.map(preferenceSummary) };
+  });
+}
+var designCandidate = external_exports.object({
+  candidateId: external_exports.string().trim().min(1).max(300),
+  designSystem: external_exports.string().trim().min(1).max(300),
+  assetType: external_exports.enum(["component", "style", "token"]),
+  name: external_exports.string().trim().min(1).max(300),
+  role: external_exports.string().trim().min(1).max(200).optional(),
+  key: external_exports.string().trim().min(1).max(300).optional(),
+  nodeId: nodeId.optional()
+});
+function preferenceAppliesToScope(preference, input) {
+  if (preference.scope.project && preference.scope.project.toLowerCase() !== input.project?.toLowerCase()) return false;
+  if (preference.scope.documentType && preference.scope.documentType.toLowerCase() !== input.documentType?.toLowerCase()) return false;
+  if (preference.scope.context && preference.scope.context.toLowerCase() !== input.context?.toLowerCase()) return false;
+  return true;
+}
+function scoreDesignCandidate(candidate, preferences, input) {
+  let score = 0;
+  const matchedPreferenceIds = [];
+  for (const preference of preferences) {
+    if (!preferenceAppliesToScope(preference, input)) continue;
+    if (preference.designSystem.toLowerCase() !== candidate.designSystem.toLowerCase()) continue;
+    const asset = preference.asset;
+    let match = 5;
+    if (asset?.role && candidate.role && asset.role.toLowerCase() === candidate.role.toLowerCase()) match += 25;
+    if (asset?.componentKey && candidate.key === asset.componentKey) match += 100;
+    if (asset?.styleKey && candidate.key === asset.styleKey) match += 100;
+    if (asset?.tokenId && candidate.key === asset.tokenId) match += 100;
+    if (asset?.componentId && candidate.nodeId === asset.componentId) match += 90;
+    if (asset?.styleId && candidate.nodeId === asset.styleId) match += 90;
+    if (asset?.componentName && asset.componentName.toLowerCase() === candidate.name.toLowerCase()) match += 70;
+    if (asset?.styleName && asset.styleName.toLowerCase() === candidate.name.toLowerCase()) match += 70;
+    if (asset?.tokenName && asset.tokenName.toLowerCase() === candidate.name.toLowerCase()) match += 70;
+    const searchable = `${preference.rule} ${preference.rationale ?? ""}`.toLowerCase();
+    if (candidate.role && searchable.includes(candidate.role.toLowerCase())) match += 10;
+    if (searchable.includes(input.intent.toLowerCase())) match += 10;
+    if (match > 5 || !asset) {
+      score += match;
+      matchedPreferenceIds.push(preference.id);
+    }
+  }
+  return { candidate, score, matchedPreferenceIds };
+}
+async function resolveDesignChoice(input) {
+  const store = await readPreferenceStore();
+  const scored = input.candidates.map((candidate) => scoreDesignCandidate(candidate, store.preferences, input)).sort((left, right) => right.score - left.score || left.candidate.name.localeCompare(right.candidate.name));
+  if (scored.length === 1) {
+    return { revision: store.revision, resolved: true, needsClarification: false, selected: scored[0].candidate, matchedPreferenceIds: scored[0].matchedPreferenceIds, reason: "Only one candidate was supplied." };
+  }
+  const top = scored[0];
+  const tied = scored.filter((item) => item.score === top.score);
+  if (top.score > 0 && tied.length === 1) {
+    return { revision: store.revision, resolved: true, needsClarification: false, selected: top.candidate, matchedPreferenceIds: top.matchedPreferenceIds, reason: "One candidate matched the confirmed user preferences more strongly." };
+  }
+  return {
+    revision: store.revision,
+    resolved: false,
+    needsClarification: true,
+    intent: input.intent,
+    question: `Multiple design-system choices are equally plausible for \u201C${input.intent}\u201D. Which should be used?`,
+    candidates: tied.map((item) => ({ ...item.candidate, score: item.score, matchedPreferenceIds: item.matchedPreferenceIds })),
+    instruction: "Do not edit until the user chooses. After the answer, offer to save it as a confirmed scoped preference so this tie does not recur."
+  };
+}
 var workflowInstructions = [
   "Use this server with the inspect-first $figma-local-workflow skill when available.",
   "For best first-pass results, always follow this order:",
   "1. figma_bridge_status \u2014 confirm exactly one Figma Desktop plugin is connected.",
-  "2. figma_list_artboards \u2014 discover clean artboard IDs and ordering; never guess node IDs.",
-  "3. figma_read_frame_content or figma_read_spread_content \u2014 read the relevant copy with hierarchy before editing.",
+  "2. figma_get_user_preferences \u2014 load confirmed per-user design-system, component, style, token, typography, layout and copy preferences before choosing assets.",
+  "3. figma_list_design_system_assets and figma_list_artboards \u2014 discover verified components/styles and clean artboard IDs; never guess IDs or redraw an available appropriate component.",
+  "4. figma_read_frame_content or figma_read_spread_content \u2014 read the relevant copy with hierarchy before editing.",
   "Use detail=summary for routine reads and overflow audits; request full only when hierarchy or hidden variants are needed.",
   "For source-to-Figma copy sync, use figma_read_copy for compact IDs/copy/bounds, diff outside Figma, then use figma_apply_copy_updates for narrow writes plus audit/export verification.",
-  "4. figma_export_frame_png \u2014 inspect each relevant artboard visually from its returned local path.",
-  "5. Analyse copy and layout together; call figma_audit_text_overflow when fit or clipping matters.",
+  "5. figma_export_frame_png \u2014 inspect each relevant artboard visually from its returned local path.",
+  "6. Analyse copy and layout together; call figma_audit_text_overflow when fit or clipping matters.",
   "Fast path after step 2: figma_prepare_review performs steps 3\u20135 for one to eight known artboards, writes their PNGs locally, and makes no edits.",
-  "6. Only then edit identified nodes with the narrowest mutation tools.",
-  "7. Re-read, re-audit, and re-export affected artboards after editing.",
+  "7. Only then edit identified nodes with the narrowest mutation tools.",
+  "8. Re-read, re-audit, and re-export affected artboards after editing.",
+  "Prefer confirmed user choices, linked-system component instances, bound variables and named Figma styles\u2014in that order\u2014over detached copies, manually reconstructed components or raw visual values.",
+  "When multiple systems or assets are equally plausible, call figma_resolve_design_choice. If it returns needsClarification=true, do not edit: ask the user to choose, then offer to save the answer with figma_set_user_preference.",
+  "Only create, update, delete or revert a stored preference after an explicit user instruction or confirmation. Never silently learn a preference from one document.",
   "Treat casing as typography: use textCase on the text layer or styled span rather than replacing natural-case characters with capitals, unless the source copy or user explicitly requires a character-level case change.",
   "For a page re-layout: inspect and export the current artboard, list page tokens or copy style from verified source nodes, compose the named replacement with figma_compose_frame, archive explicit previous sibling nodes only after the replacement succeeds, then inspect the returned audit and PNG.",
   "Prefer figma_archive_nodes or figma_supersede_layout over deletion or opacity-zero superseded layers. Use approved local image paths only when the user placed that file in scope.",
@@ -31565,6 +31832,91 @@ server.registerTool("figma_bridge_status", {
 }, async () => {
   try {
     return output(await bridgeStatusForMcp());
+  } catch (error51) {
+    return failure(error51);
+  }
+});
+server.registerTool("figma_get_user_preferences", {
+  title: "Get local Figma user preferences",
+  description: "Load the confirmed per-user design-system preferences stored locally by this bridge. Call this immediately after bridge status and before choosing components, styles, tokens, typography or layout. Works without a connected Figma plugin.",
+  inputSchema: {
+    designSystem: external_exports.string().trim().min(1).max(300).optional(),
+    category: preferenceCategory.optional(),
+    query: external_exports.string().trim().min(1).max(500).optional(),
+    includeHistory: external_exports.boolean().default(false)
+  }
+}, async (input) => {
+  try {
+    return output(await getUserPreferences(input));
+  } catch (error51) {
+    return failure(error51);
+  }
+});
+server.registerTool("figma_set_user_preference", {
+  title: "Set a confirmed Figma user preference",
+  description: "Create or update one local per-user design-system preference. Call only after the user explicitly states or confirms the rule. Read preferences first and pass its revision to prevent concurrent overwrites.",
+  inputSchema: {
+    confirmed: external_exports.literal(true).describe("Assert that the user explicitly stated or confirmed this preference."),
+    expectedRevision: external_exports.number().int().min(0),
+    preferenceId: external_exports.string().uuid().optional().describe("Provide an existing ID to update it; omit to create a new preference."),
+    designSystem: external_exports.string().trim().min(1).max(300),
+    category: preferenceCategory,
+    rule: external_exports.string().trim().min(1).max(2e3),
+    scope: preferenceScope.default({}),
+    asset: preferenceAsset.optional(),
+    rationale: external_exports.string().trim().min(1).max(1e3).optional(),
+    source: external_exports.string().trim().min(1).max(500).default("Explicit user instruction")
+  }
+}, async (input) => {
+  try {
+    return output(await setUserPreference(input));
+  } catch (error51) {
+    return failure(error51);
+  }
+});
+server.registerTool("figma_delete_user_preference", {
+  title: "Delete a confirmed Figma user preference",
+  description: "Delete one stored preference only after the user explicitly requests it. Read preferences first and pass its current revision.",
+  inputSchema: {
+    confirmed: external_exports.literal(true),
+    expectedRevision: external_exports.number().int().min(0),
+    preferenceId: external_exports.string().uuid()
+  }
+}, async (input) => {
+  try {
+    return output(await deleteUserPreference(input));
+  } catch (error51) {
+    return failure(error51);
+  }
+});
+server.registerTool("figma_revert_user_preferences", {
+  title: "Revert local Figma user preferences",
+  description: "Restore the retained snapshot from an earlier preference revision after explicit user confirmation. This creates a new revision and preserves history.",
+  inputSchema: {
+    confirmed: external_exports.literal(true),
+    expectedRevision: external_exports.number().int().min(0),
+    targetRevision: external_exports.number().int().min(0)
+  }
+}, async (input) => {
+  try {
+    return output(await revertUserPreferences(input));
+  } catch (error51) {
+    return failure(error51);
+  }
+});
+server.registerTool("figma_resolve_design_choice", {
+  title: "Resolve a design-system choice",
+  description: "Compare plausible components, styles or tokens against confirmed user preferences. If the result needs clarification, stop and ask the returned question instead of guessing or editing.",
+  inputSchema: {
+    intent: external_exports.string().trim().min(1).max(500),
+    project: external_exports.string().trim().min(1).max(200).optional(),
+    documentType: external_exports.string().trim().min(1).max(200).optional(),
+    context: external_exports.string().trim().min(1).max(500).optional(),
+    candidates: external_exports.array(designCandidate).min(1).max(50)
+  }
+}, async (input) => {
+  try {
+    return output(await resolveDesignChoice(input));
   } catch (error51) {
     return failure(error51);
   }
@@ -31936,6 +32288,55 @@ server.registerTool("figma_list_page_tokens", {
 }, async (input) => {
   try {
     return output(await sendCommand("listPageTokens", input, 12e4));
+  } catch (error51) {
+    return failure(error51);
+  }
+});
+server.registerTool("figma_list_design_system_assets", {
+  title: "List available Figma design-system assets",
+  description: "Discover components, component sets, named styles and variables verified in the open file, including remote assets already used on the page and linked library variable collections enabled by the user. Use before constructing UI from raw values.",
+  inputSchema: {
+    includeLinkedLibraries: external_exports.boolean().default(true),
+    limit: external_exports.number().int().min(1).max(1e3).default(250),
+    scanLimit: external_exports.number().int().min(1).max(1e4).default(2e3)
+  }
+}, async (input) => {
+  try {
+    return output(await sendCommand("listDesignSystemAssets", input, 12e4));
+  } catch (error51) {
+    return failure(error51);
+  }
+});
+server.registerTool("figma_create_component_instance", {
+  title: "Create a Figma component instance",
+  description: "Create an instance from a verified local component ID or an enabled/importable library component key. Prefer this over manually reconstructing a component. Resolve design-system ties before calling.",
+  inputSchema: external_exports.object({
+    componentId: nodeId.optional(),
+    componentKey: external_exports.string().trim().min(1).max(300).optional(),
+    componentProperties: external_exports.record(external_exports.string(), external_exports.union([external_exports.string(), external_exports.boolean()])).optional(),
+    parentId: nodeId.optional(),
+    name: external_exports.string().trim().min(1).max(200).optional(),
+    ...position
+  }).refine((input) => Number(Boolean(input.componentId)) + Number(Boolean(input.componentKey)) === 1, "Provide exactly one of componentId or componentKey.")
+}, async (input) => {
+  try {
+    return output(await sendCommand("createComponentInstance", input));
+  } catch (error51) {
+    return failure(error51);
+  }
+});
+server.registerTool("figma_apply_design_style", {
+  title: "Apply a verified Figma style",
+  description: "Apply a named local or library style to existing nodes by ID or key. Prefer this over copying raw paint, effect or typography values. Resolve design-system ties before calling.",
+  inputSchema: external_exports.object({
+    targetNodeIds: external_exports.array(nodeId).min(1).max(100),
+    styleId: nodeId.optional(),
+    styleKey: external_exports.string().trim().min(1).max(300).optional(),
+    aspect: external_exports.enum(["fill", "stroke", "effect", "text"])
+  }).refine((input) => Number(Boolean(input.styleId)) + Number(Boolean(input.styleKey)) === 1, "Provide exactly one of styleId or styleKey.")
+}, async (input) => {
+  try {
+    return output(await sendCommand("applyDesignStyle", input));
   } catch (error51) {
     return failure(error51);
   }

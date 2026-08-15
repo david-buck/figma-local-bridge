@@ -2,7 +2,7 @@ figma.showUI(__html__, { width: 360, height: 250, title: "Local MCP Bridge" });
 
 let bridgeGeneration = 0;
 const bridgeUrl = "http://localhost:3846";
-const pluginVersion = "0.9.2";
+const pluginVersion = "0.10.0";
 const bridgeClientId = `figma-client-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const mutatingCommands = new Set([
   "moveResizeReparent", "updateText", "deleteNode", "duplicateNode",
@@ -10,6 +10,7 @@ const mutatingCommands = new Set([
   "importSvg", "styleNode", "createColorTokens", "setAutoLayout",
   "applyCopyUpdates", "setTextFrame", "splitTextBlock",
   "archiveNodes", "composeFrame", "copyStyleFromNode", "copyImageFill", "placeLocalImage",
+  "createComponentInstance", "applyDesignStyle",
 ]);
 
 function bridgeStatus(message, kind = "") {
@@ -1030,6 +1031,128 @@ async function listPageTokens(input) {
   return result;
 }
 
+function componentSummary(component, usageCount = 0) {
+  return {
+    id: component.id, key: component.key || null, name: component.name, description: component.description || "",
+    remote: component.remote === true, usageCount,
+    componentSet: component.parent?.type === "COMPONENT_SET"
+      ? { id: component.parent.id, key: component.parent.key || null, name: component.parent.name, remote: component.parent.remote === true }
+      : null,
+    componentProperties: cloneValue(component.componentPropertyDefinitions ?? {}),
+  };
+}
+
+function styleSummary(style, usageCount = 0) {
+  return { id: style.id, key: style.key || null, name: style.name, type: style.type, description: style.description || "", remote: style.remote === true, usageCount };
+}
+
+async function listDesignSystemAssets(input) {
+  const usageByComponentId = new Map();
+  const usedStyleIds = new Map();
+  const pageNodes = figma.currentPage.findAll(() => true).slice(0, input.scanLimit);
+  for (const node of pageNodes) {
+    if (node.type === "INSTANCE") {
+      const main = await node.getMainComponentAsync();
+      if (main) usageByComponentId.set(main.id, (usageByComponentId.get(main.id) ?? 0) + 1);
+    }
+    for (const [aspect, property] of [["fill", "fillStyleId"], ["stroke", "strokeStyleId"], ["effect", "effectStyleId"], ["grid", "gridStyleId"], ["text", "textStyleId"]]) {
+      const styleId = node[property];
+      if (typeof styleId === "string" && styleId) {
+        const usage = usedStyleIds.get(styleId) ?? { aspects: new Set(), count: 0 };
+        usage.aspects.add(aspect);
+        usage.count += 1;
+        usedStyleIds.set(styleId, usage);
+      }
+    }
+  }
+  const [localComponents, localComponentSets, localPaintStyles, localTextStyles, localEffectStyles, localGridStyles, localVariables, localCollections] = await Promise.all([
+    figma.getLocalComponentsAsync(), figma.getLocalComponentSetsAsync(), figma.getLocalPaintStylesAsync(), figma.getLocalTextStylesAsync(),
+    figma.getLocalEffectStylesAsync(), figma.getLocalGridStylesAsync(), figma.variables.getLocalVariablesAsync(), figma.variables.getLocalVariableCollectionsAsync(),
+  ]);
+  const usedComponents = [];
+  for (const [id, count] of usageByComponentId) {
+    const component = await figma.getNodeByIdAsync(id);
+    if (component?.type === "COMPONENT") usedComponents.push(componentSummary(component, count));
+  }
+  const usedStyles = [];
+  for (const [id, usage] of usedStyleIds) {
+    const style = await figma.getStyleByIdAsync(id);
+    if (style) usedStyles.push({ ...styleSummary(style, usage.count), aspects: [...usage.aspects] });
+  }
+  let linkedLibraryVariableCollections = [];
+  let linkedLibraryWarning = null;
+  if (input.includeLinkedLibraries && figma.teamLibrary?.getAvailableLibraryVariableCollectionsAsync) {
+    try {
+      linkedLibraryVariableCollections = (await figma.teamLibrary.getAvailableLibraryVariableCollectionsAsync()).slice(0, input.limit).map((collection) => ({ key: collection.key, name: collection.name, libraryName: collection.libraryName }));
+    } catch (error) {
+      linkedLibraryWarning = errorMessage(error);
+    }
+  }
+  return {
+    page: { id: figma.currentPage.id, name: figma.currentPage.name },
+    scan: { nodeCount: pageNodes.length, truncated: pageNodes.length === input.scanLimit },
+    components: {
+      used: usedComponents.slice(0, input.limit),
+      local: localComponents.slice(0, input.limit).map((component) => componentSummary(component, usageByComponentId.get(component.id) ?? 0)),
+      localSets: localComponentSets.slice(0, input.limit).map((set) => ({ id: set.id, key: set.key || null, name: set.name, description: set.description || "", remote: set.remote === true, variantGroupProperties: cloneValue(set.variantGroupProperties ?? {}) })),
+    },
+    styles: {
+      used: usedStyles.slice(0, input.limit),
+      local: [...localPaintStyles, ...localTextStyles, ...localEffectStyles, ...localGridStyles].slice(0, input.limit).map((style) => styleSummary(style)),
+    },
+    variables: {
+      localCollections: localCollections.slice(0, input.limit).map((collection) => ({ id: collection.id, key: collection.key || null, name: collection.name, modes: collection.modes, variableCount: collection.variableIds.length })),
+      local: localVariables.slice(0, input.limit).map((variable) => ({ id: variable.id, key: variable.key || null, name: variable.name, type: variable.resolvedType, collectionId: variable.variableCollectionId, scopes: variable.scopes })),
+      linkedLibraryCollections: linkedLibraryVariableCollections,
+    },
+    ...(linkedLibraryWarning ? { warning: `Linked library variables could not be listed: ${linkedLibraryWarning}` } : {}),
+    guidance: "Prefer a matching used remote component/style, then a local component/style or bound variable. A library must already be enabled in this Figma file; plugins cannot enable libraries.",
+  };
+}
+
+async function createComponentInstance(input) {
+  let component;
+  if (input.componentId) {
+    component = await figma.getNodeByIdAsync(input.componentId);
+    if (component?.type !== "COMPONENT") throw new Error(`Component ${input.componentId} was not found in the current file.`);
+  } else {
+    component = await figma.importComponentByKeyAsync(input.componentKey);
+  }
+  const instance = component.createInstance();
+  appendToParent(instance, input.parentId);
+  instance.name = input.name ?? component.name;
+  instance.x = input.x;
+  instance.y = input.y;
+  if (input.componentProperties && Object.keys(input.componentProperties).length) instance.setProperties(input.componentProperties);
+  focus(instance);
+  return { createdNodeIds: [instance.id], component: componentSummary(component), instance: serializeNode(instance), componentProperties: cloneValue(instance.componentProperties ?? {}) };
+}
+
+async function applyDesignStyle(input) {
+  const style = input.styleId ? await figma.getStyleByIdAsync(input.styleId) : await figma.importStyleByKeyAsync(input.styleKey);
+  if (!style) throw new Error("The requested Figma style was not found.");
+  const targets = input.targetNodeIds.map(sceneNode);
+  for (const target of targets) {
+    if (input.aspect === "fill") {
+      if (!("setFillStyleIdAsync" in target)) throw new Error(`Node ${target.id} cannot accept a fill style.`);
+      await target.setFillStyleIdAsync(style.id);
+    } else if (input.aspect === "stroke") {
+      if (!("setStrokeStyleIdAsync" in target)) throw new Error(`Node ${target.id} cannot accept a stroke style.`);
+      await target.setStrokeStyleIdAsync(style.id);
+    } else if (input.aspect === "effect") {
+      if (!("setEffectStyleIdAsync" in target)) throw new Error(`Node ${target.id} cannot accept an effect style.`);
+      await target.setEffectStyleIdAsync(style.id);
+    } else {
+      if (target.type !== "TEXT" || !("setTextStyleIdAsync" in target)) throw new Error(`Node ${target.id} cannot accept a text style.`);
+      if (style.type !== "TEXT") throw new Error(`Style ${style.name} is not a text style.`);
+      await figma.loadFontAsync(style.fontName);
+      await target.setTextStyleIdAsync(style.id);
+    }
+  }
+  if (targets.length) figma.viewport.scrollAndZoomIntoView(targets);
+  return { style: styleSummary(style), aspect: input.aspect, mutatedNodeIds: targets.map((target) => target.id), targets: targets.map(serializeNode) };
+}
+
 async function copyStyleFromNode(input) {
   const source = sceneNode(input.sourceNodeId);
   const targets = input.targetNodeIds.map(sceneNode);
@@ -1304,6 +1427,12 @@ async function execute(name, input) {
   if (name === "copyStyleFromNode") return copyStyleFromNode(input);
 
   if (name === "listPageTokens") return listPageTokens(input);
+
+  if (name === "listDesignSystemAssets") return listDesignSystemAssets(input);
+
+  if (name === "createComponentInstance") return createComponentInstance(input);
+
+  if (name === "applyDesignStyle") return applyDesignStyle(input);
 
   if (name === "copyImageFill") return copyImageFill(input);
 

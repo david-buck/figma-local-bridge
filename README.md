@@ -42,6 +42,8 @@ cd figma-local-bridge
 - Compose a replacement frame with panels, dividers, and styled-span text in one guarded command, then audit and export it.
 - Archive or supersede explicit sibling nodes into a hidden named group with replacement metadata instead of deleting them or leaving opacity-zero layers.
 - List verified local variables/styles plus colours and fonts used on the page, or copy style from a known on-brand node.
+- Discover verified local and currently used library components/styles, create linked component instances, and apply named styles by ID or key.
+- Store explicit per-user design-system preferences locally, query/update/revert them through the LLM, and return a no-edit clarification result when plausible systems tie.
 - Copy/crop an existing Figma image fill or place an explicitly approved local PNG/JPEG/GIF/WebP file.
 
 It deliberately binds only to `127.0.0.1` and accepts only one open Figma file at a time. It does not accept arbitrary JavaScript. SVG imports reject scripts, event handlers, iframes, and `foreignObject` elements.
@@ -110,16 +112,25 @@ For a human-readable connection check, open [http://localhost:3846/](http://loca
 
 The MCP advertises this sequence in its server instructions, and the companion personal skill at `~/.codex/skills/figma-local-workflow` reinforces it:
 
-1. `figma_list_artboards`
-2. `figma_read_frame_content` or `figma_read_spread_content`
-3. `figma_export_frame_png`
-4. Analyse copy and layout together; run `figma_audit_text_overflow` when fit matters
-5. Only then edit identified nodes
-6. Re-read, re-audit, and re-export after editing
+1. `figma_bridge_status`, then `figma_get_user_preferences`
+2. `figma_list_design_system_assets`, then `figma_list_artboards`
+3. `figma_read_frame_content` or `figma_read_spread_content`
+4. `figma_export_frame_png`
+5. Analyse copy and layout together; run `figma_audit_text_overflow` when fit matters
+6. Only then edit identified nodes
+7. Re-read, re-audit, and re-export after editing
 
 After artboard discovery, `figma_prepare_review` is the faster equivalent for one to eight known artboards. It performs steps 2–4 in order, writes each PNG locally, and does not edit the file.
 
 This avoids guessed node IDs, partial-copy edits, and layout changes made without visual evidence.
+
+### Design-system preference workflow
+
+`figma_get_user_preferences` returns only choices the user explicitly confirmed. When choosing assets, prefer a matching scoped preference, then a linked component already used in the file, then another verified component/style/token, and construct from raw values only as a fallback. Use `figma_create_component_instance` and `figma_apply_design_style` to preserve linkage.
+
+If multiple systems remain equally plausible, call `figma_resolve_design_choice`. A tie returns `needsClarification: true` with candidate details and must not trigger an edit. Ask the user which system to use; apply that answer once, or save it with `figma_set_user_preference` only after explicit confirmation. Preferences can be queried, updated, deleted, and reverted in ordinary LLM conversation. Revision guards prevent two MCP tasks from silently overwriting each other.
+
+Preferences are private to the local OS user and stored at `~/.figma-local-bridge/preferences.json` by default. Set `FIGMA_PREFERENCES_DIR` to relocate the store. The bridge never infers or saves preferences from the canvas automatically.
 
 ### External copy-sync workflow
 
@@ -135,7 +146,7 @@ Delete only a clearly stray element identified by the user. Preserve all other n
 ### Page re-layout workflow
 
 1. List artboards, read the target in `summary` mode, and export its current PNG.
-2. Call `figma_list_page_tokens` and, when useful, `figma_copy_style_from_node` against verified on-brand source nodes. Do not approximate available fonts or colours.
+2. Call `figma_list_design_system_assets` and `figma_list_page_tokens`. Prefer verified linked components, named styles, and variables; use `figma_copy_style_from_node` against an on-brand source node when needed. Do not approximate available assets, fonts, or colours.
 3. Call `figma_compose_frame` with one named replacement frame and ordered frame/rectangle/text elements. Use styled spans for mixed emphasis and typographic case inside a single text layer; keep the stored copy in natural case. The command removes its whole new subtree if any element fails.
 4. Prefer passing explicit `archiveNodeIds` to the composer so previous sibling content is grouped and hidden only after the replacement succeeds. Otherwise verify the replacement, then call `figma_supersede_layout` or `figma_archive_nodes`.
 5. Inspect the returned compact overflow audit and local PNG. Re-read in `full` mode only when hierarchy or hidden variants require diagnosis.
@@ -180,6 +191,10 @@ The bridge keeps its command surface intentionally narrow. It exposes the follow
 - `figma_archive_nodes` / `figma_supersede_layout` — hide explicit prior siblings in a named reversible group and record the replacement relationship.
 - `figma_compose_frame` — atomically create a frame, panels/dividers, and styled-span text, optionally archive previous content, then audit/export.
 - `figma_copy_style_from_node` / `figma_list_page_tokens` — inherit verified on-brand styling and discover local variables/styles plus page usage.
+- `figma_list_design_system_assets` — discover components, styles, and variables verified in the current file, including remote assets currently used and enabled linked-library variable collections.
+- `figma_create_component_instance` / `figma_apply_design_style` — create a linked instance or apply a named local/library style by verified ID or key.
+- `figma_get_user_preferences` / `figma_set_user_preference` / `figma_delete_user_preference` / `figma_revert_user_preferences` — manage explicit, revision-guarded per-user design-system guidance.
+- `figma_resolve_design_choice` — score candidates against confirmed scoped preferences and require clarification rather than guessing when they tie.
 - `figma_copy_image_fill` / `figma_place_local_image` — reuse/crop an existing Figma image or place an explicitly approved local raster image.
 
 For brand assets, read a trusted SVG file locally and pass its content to `figma_import_svg`; do not redraw logo artwork as text or paths.
@@ -191,3 +206,5 @@ When a prompt names colours, call `figma_create_color_tokens` before creating ar
 ## Security model
 
 The bridge listens only on localhost (`127.0.0.1`), so it is not reachable over your network. Browser requests are accepted only without an Origin header or from Figma origins; unrelated web pages cannot use its CORS surface. It intentionally removes the former shared token to make the local Figma workflow frictionless. Other local processes running as you on this Mac could still call its port while Codex is open, so do not use it on a shared, untrusted Mac.
+
+The preference store is created with user-only file permissions. It contains guidance you explicitly ask the LLM to remember, not Figma document contents. No preference is learned or written automatically.

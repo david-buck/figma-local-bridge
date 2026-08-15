@@ -24,7 +24,7 @@ async function loadPluginHelpers() {
     setInterval,
     setTimeout,
   });
-  vm.runInContext(`${source}\nglobalThis.__pluginTests = { pollQuery, replaceTextPreservingStyles, visibilityInfo, auditTextOverflow, auditSummary, archiveNodes, createStyledText, composeFrame, setTextFrame, splitTextBlock, figma };`, context);
+  vm.runInContext(`${source}\nglobalThis.__pluginTests = { pollQuery, replaceTextPreservingStyles, visibilityInfo, auditTextOverflow, auditSummary, archiveNodes, createStyledText, composeFrame, setTextFrame, splitTextBlock, createComponentInstance, applyDesignStyle, figma };`, context);
   return context.__pluginTests;
 }
 
@@ -111,6 +111,17 @@ function configurePage(figma, children) {
         return null;
       };
       return visit(this.children);
+    },
+    findAll(predicate) {
+      const found = [];
+      const visit = (nodes) => {
+        for (const node of nodes) {
+          if (predicate(node)) found.push(node);
+          if (node.children) visit(node.children);
+        }
+      };
+      visit(this.children);
+      return found;
     },
   };
   for (const child of children) child.parent = page;
@@ -239,6 +250,47 @@ test("styled text loads span fonts and applies range typography in one layer", a
   assert.equal(node.textAutoResize, "HEIGHT");
   assert.deepEqual(node.calls.map((call) => call.method), ["font", "size", "case"]);
   assert.equal(node.calls[2].value, "UPPER");
+});
+
+test("component instances are created from verified library keys with requested properties", async () => {
+  const { createComponentInstance, figma } = await loadPluginHelpers();
+  configurePage(figma, []);
+  const component = {
+    id: "4:1", key: "library-card", name: "Card", type: "COMPONENT", description: "", remote: true,
+    parent: { type: "PAGE" }, componentPropertyDefinitions: { Density: { type: "VARIANT", defaultValue: "Comfortable" } },
+    createInstance() {
+      return {
+        id: "4:2", name: "Card", type: "INSTANCE", x: 0, y: 0, width: 200, height: 100, visible: true, opacity: 1,
+        componentProperties: {}, setProperties(values) { this.componentProperties = values; },
+      };
+    },
+  };
+  figma.importComponentByKeyAsync = async (key) => {
+    assert.equal(key, "library-card");
+    return component;
+  };
+  const result = await createComponentInstance({ componentKey: "library-card", componentProperties: { Density: "Compact" }, name: "Summary", x: 20, y: 30 });
+  assert.equal(result.instance.id, "4:2");
+  assert.equal(result.instance.name, "Summary");
+  assert.equal(result.componentProperties.Density, "Compact");
+});
+
+test("named text styles load their font and apply by style ID", async () => {
+  const { applyDesignStyle, figma } = await loadPluginHelpers();
+  const text = {
+    id: "5:1", name: "Heading", type: "TEXT", characters: "Natural case", width: 120, height: 24, visible: true, opacity: 1,
+    fontName: { family: "Inter", style: "Regular" }, fontSize: 16, textAutoResize: "WIDTH_AND_HEIGHT",
+    async setTextStyleIdAsync(id) { this.appliedStyleId = id; },
+  };
+  configurePage(figma, [text]);
+  const style = { id: "S:1", key: "heading-style", name: "Heading/Large", type: "TEXT", description: "", remote: true, fontName: { family: "SBS Sans", style: "Bold" } };
+  figma.getStyleByIdAsync = async () => style;
+  let loadedFont;
+  figma.loadFontAsync = async (font) => { loadedFont = font; };
+  const result = await applyDesignStyle({ targetNodeIds: [text.id], styleId: style.id, aspect: "text" });
+  assert.equal(text.appliedStyleId, style.id);
+  assert.equal(loadedFont.family, "SBS Sans");
+  assert.deepEqual(Array.from(result.mutatedNodeIds), [text.id]);
 });
 
 test("compose frame removes the entire new subtree when a later element fails", async () => {
