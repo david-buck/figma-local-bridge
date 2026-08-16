@@ -1,6 +1,6 @@
 ---
 name: figma-local-workflow
-description: Use the local figma_local MCP bridge to inspect, analyse, edit, copy-sync, re-layout, compose, archive, style, use design-system components and confirmed user preferences, add approved images to, or export the Figma Design file currently open in Figma Desktop. Trigger for requests to review artboards or spreads, sync external source copy such as Fieldwerk, read or revise copy, inspect or replace layouts, use linked components/styles/tokens, audit text overflow, export frame PNGs, or make controlled canvas changes through the Local MCP Bridge plugin.
+description: Use the local figma_local MCP bridge to inspect, analyse, edit, copy-sync, re-layout, compose, archive, style, use design-system components and confirmed user preferences, add approved images to, or export the Figma Design file currently open in Figma Desktop. Trigger for requests to review artboards or spreads, sync copy with an external source, read or revise copy, inspect or replace layouts, use linked components/styles/tokens, audit text overflow, export frame PNGs, or make controlled canvas changes through the Local MCP Bridge plugin.
 ---
 
 # Local Figma workflow
@@ -16,17 +16,23 @@ Use an inspect-first sequence. Do not begin by querying arbitrary page nodes or 
    - Call `figma_read_frame_content` with `detail: summary` for one artboard.
    - Call `figma_read_spread_content` with `detail: summary` for a spread, passing `nodeIds` in the order returned by `figma_list_artboards`.
    - Request `detail: full` only when hierarchy or hidden variants are needed.
-5. Call `figma_export_frame_png` for each relevant artboard and inspect the returned local PNG path. Use the visual together with the structured copy; neither is sufficient alone.
+5. For routine copy-only work, use the structured read and `figma_audit_text_overflow`; do not export or screenshot by default. Export or screenshot only when layout, imagery, geometry or uncertain wrapping needs visual judgement.
 6. Analyse copy and layout before proposing or making changes. Call `figma_audit_text_overflow` when text fit, truncation, clipping, or typography may matter.
 7. Only then edit identified nodes. Prefer the narrowest appropriate mutation tool and preserve unrelated content.
 8. Verify after editing:
    - Re-read affected frame or spread content.
    - Re-run the overflow audit when text or dimensions changed.
-   - Re-export the affected artboard PNG and inspect it.
+   - Capture a screenshot only for uncertain wraps, adjacency or visual hierarchy; export a PNG only for a full-page/layout review, imagery or retained comparison.
 
 ## Fast review path
 
-After artboard discovery, prefer `figma_prepare_review` when reviewing one to eight known artboards. It performs the read, local PNG exports, and optional overflow audits in that order without editing. Inspect every returned PNG before analysis. Use the individual tools when only one result is needed or when diagnosing a failed step.
+After artboard discovery, use `figma_prepare_review` only for a visual page/spread review. It performs the read, local PNG exports, and optional overflow audits in that order without editing. For copy reconciliation, prefer `figma_read_copy` and overflow auditing so routine work does not consume image tokens.
+
+## Layout responsibility and evidence cost
+
+Use the bridge for deterministic mechanics: frame geometry, hierarchy, components, named styles, text bounds, overflow, alignment and mutations. Use this skill for editorial hierarchy, page purpose, content density, print-reading judgement and deciding when an image review is worth its cost.
+
+Do not ask image output to prove routine text updates. Treat text bounds, re-read copy and overflow results as sufficient unless a change may alter adjacent elements, column balance, image relationship or hierarchy. Prefer one targeted screenshot over a PNG export when a visual check is necessary.
 
 ## Design-system preferences and tie-breaks
 
@@ -52,17 +58,18 @@ Use a capable subagent for copy analysis or source-to-Figma diffing when it will
 
 The bridge has one live plugin connection and Figma mutations are serial. Delegation improves preparation quality and token use; it does not make the live write path parallel or safer.
 
-## Copy sync recipe
+## External copy-sync recipe
 
-Use this deterministic flow when Fieldwerk or another external source is the copy source of truth:
+Use this flow only after the user identifies which source is authoritative and the intended sync direction:
 
 1. Confirm the bridge/page and list artboards. Identify the exact target frame IDs.
 2. Call `figma_read_copy` with those frame IDs and `includeHidden: false`. Use its text IDs and copy as the Figma side of the diff; do not request full hierarchy unless the compact result is ambiguous.
-3. Diff source fields against Figma text IDs outside the bridge. Omit unchanged nodes. Preserve `expectedText` from the compact read for every proposed update.
-4. For a small, known-safe batch, call `figma_apply_copy_updates` with narrow updates. Keep hidden text excluded unless the source explicitly targets a hidden variant. For longer copy, several frames or a bridge that has been slow, use serial `figma_update_text` calls instead.
-5. Audit and export *after* the writes in separate calls. Do not make a large write, audit and export transaction depend on one long bridge request.
-6. Inspect every exported PNG and audit result. If hierarchy or fit changed, use `figma_set_text_frame` for sizing/auto-resize or `figma_split_text_block` at a verified character boundary; then audit and export again.
-7. Re-read compact copy when an `expectedText` guard fails or verification is incomplete. Never overwrite a concurrent Figma edit from stale source data.
+3. Fetch the latest external source, then diff it against the visible Figma text IDs in the user-requested direction. Omit unchanged nodes and preserve source-specific metadata that the user did not ask to replace.
+4. Re-fetch or stop on a source conflict. Never overwrite a newer external or Figma change blindly.
+5. Preserve `expectedText` from the compact Figma read for every proposed Figma update. Keep hidden text excluded unless the source explicitly targets a hidden variant.
+6. For a small, known-safe Figma batch, call `figma_apply_copy_updates`. For longer copy, several frames or a bridge that has been slow, use serial `figma_update_text` calls instead.
+7. Audit and inspect after layout-affecting Figma edits. Use a re-read and overflow audit for routine copy-only edits; use a screenshot for uncertain wraps and a PNG export for layout, imagery, full-page review or retained comparison.
+8. Re-read compact copy when an `expectedText` guard fails or verification is incomplete. Never overwrite a concurrent edit from stale source data.
 
 ### Timeout recovery
 
@@ -95,6 +102,6 @@ Use this deterministic flow when replacing an existing brochure page or artboard
 - Use `figma_compose_frame` for bounded page composition that would otherwise require many serial creation calls. Treat its audit and exported PNG as required verification, not optional decoration.
 - Use `figma_place_local_image` only for an absolute local image path the user explicitly placed in scope. Prefer `figma_copy_image_fill` when an approved image already exists in Figma.
 - Delete only a clearly stray element that the user identified. Otherwise preserve it, including superseded or hidden elements.
-- Prefer `figma_export_frame_png` over inline screenshots for detailed visual review; it avoids base64 truncation.
+- Use `figma_screenshot` for a targeted, one-off visual check. Use `figma_export_frame_png` only for a full-page/layout review, imagery, comparison or an artefact that needs to be retained; do not export routine copy-only changes.
 - Keep bridge calls serial and in one task. A newer open plugin deliberately takes over the single local connection; the displaced plugin stops retrying.
 - If the `figma_local` tools are absent from the task, stop and report that Codex has not loaded the configured MCP server. Do not substitute the hosted Figma MCP without the user's permission.

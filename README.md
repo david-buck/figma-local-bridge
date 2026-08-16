@@ -134,7 +134,7 @@ Preferences are private to the local OS user and stored at `~/.figma-local-bridg
 
 ### External copy-sync workflow
 
-When Fieldwerk or another external system is the source of truth:
+When the user identifies an external system as the source of truth:
 
 1. List artboards and call `figma_read_copy` for the exact target frame IDs.
 2. Diff external fields against the returned text IDs and `copy`. Omit unchanged nodes.

@@ -2,7 +2,7 @@ figma.showUI(__html__, { width: 360, height: 250, title: "Local MCP Bridge" });
 
 let bridgeGeneration = 0;
 const bridgeUrl = "http://localhost:3846";
-const pluginVersion = "0.10.0";
+const pluginVersion = "0.10.1";
 const bridgeClientId = `figma-client-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const mutatingCommands = new Set([
   "moveResizeReparent", "updateText", "deleteNode", "duplicateNode",
