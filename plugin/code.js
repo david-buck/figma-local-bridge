@@ -2,7 +2,7 @@ figma.showUI(__html__, { width: 360, height: 250, title: "Local MCP Bridge" });
 
 let bridgeGeneration = 0;
 const bridgeUrl = "http://localhost:3846";
-const pluginVersion = "0.10.1";
+const pluginVersion = "0.10.2";
 const bridgeClientId = `figma-client-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const mutatingCommands = new Set([
   "moveResizeReparent", "updateText", "deleteNode", "duplicateNode",
@@ -15,6 +15,30 @@ const mutatingCommands = new Set([
 
 function bridgeStatus(message, kind = "") {
   figma.ui.postMessage({ type: "bridge-status", message, kind });
+}
+
+function commandLabel(name) {
+  const words = name
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .replace(/\bpng\b/g, "PNG")
+    .replace(/\bsvg\b/g, "SVG");
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+function activityForCommand(name) {
+  const mutating = mutatingCommands.has(name);
+  return { name, label: commandLabel(name), mutating };
+}
+
+function bridgeActivity(command, phase, ok, error) {
+  figma.ui.postMessage({
+    type: "bridge-activity",
+    phase,
+    ...activityForCommand(command.name),
+    ...(ok === undefined ? {} : { ok }),
+    ...(error ? { error: errorMessage(error) } : {}),
+  });
 }
 
 function errorMessage(error) {
@@ -103,6 +127,7 @@ async function startBridge() {
         const message = await bridgeRequest(`/v1/poll${pollQuery(sessionId)}`);
         if (!message?.command || generation !== bridgeGeneration) continue;
         let result;
+        bridgeActivity(message.command, "start");
         try {
           result = await executeWithHeartbeat(sessionId, message.command);
           if (mutatingCommands.has(message.command.name)) figma.commitUndo();
@@ -113,6 +138,7 @@ async function startBridge() {
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ sessionId, id: message.command.id, ok: false, error: errorMessage(error), info: bridgeContext() }),
           });
+          bridgeActivity(message.command, "finish", false, error);
           continue;
         }
         await bridgeRequest("/v1/result", {
@@ -120,6 +146,7 @@ async function startBridge() {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ sessionId, id: message.command.id, ok: true, result, info: bridgeContext() }),
         });
+        bridgeActivity(message.command, "finish", true);
       }
     } catch (error) {
       if (generation !== bridgeGeneration) return;

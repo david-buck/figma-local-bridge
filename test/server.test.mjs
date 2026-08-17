@@ -119,7 +119,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     capabilities: {},
     clientInfo: { name: "figma-bridge-test", version: "1.0.0" },
   });
-  assert.equal(initialized.serverInfo.version, "0.10.1");
+  assert.equal(initialized.serverInfo.version, "0.10.2");
   assert.match(initialized.instructions, /figma_prepare_review/);
   assert.match(initialized.instructions, /figma_apply_copy_updates/);
   rpc.notify("notifications/initialized");
@@ -221,7 +221,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     capabilities: {},
     clientInfo: { name: "figma-bridge-proxy-test", version: "1.0.0" },
   });
-  assert.equal(proxyInitialized.serverInfo.version, "0.10.1");
+  assert.equal(proxyInitialized.serverInfo.version, "0.10.2");
   proxyRpc.notify("notifications/initialized");
   const proxyStatus = toolJson(await proxyRpc.request("tools/call", { name: "figma_bridge_status", arguments: {} }));
   assert.equal(proxyStatus.connected, true);

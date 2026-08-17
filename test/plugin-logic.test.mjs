@@ -24,7 +24,7 @@ async function loadPluginHelpers() {
     setInterval,
     setTimeout,
   });
-  vm.runInContext(`${source}\nglobalThis.__pluginTests = { pollQuery, replaceTextPreservingStyles, visibilityInfo, auditTextOverflow, auditSummary, archiveNodes, createStyledText, composeFrame, setTextFrame, splitTextBlock, createComponentInstance, applyDesignStyle, figma };`, context);
+  vm.runInContext(`${source}\nglobalThis.__pluginTests = { pollQuery, activityForCommand, replaceTextPreservingStyles, visibilityInfo, auditTextOverflow, auditSummary, archiveNodes, createStyledText, composeFrame, setTextFrame, splitTextBlock, createComponentInstance, applyDesignStyle, figma };`, context);
   return context.__pluginTests;
 }
 
@@ -36,6 +36,16 @@ test("poll query is encoded without browser-only URLSearchParams", async () => {
     helpers.pollQuery("figma session+1"),
     "?sessionId=figma%20session%2B1&pageId=0%3A1&pageName=Brochure%20frames%20%26%20copy%20%2F%20M%C4%81ori&selectionCount=1",
   );
+});
+
+test("plugin activity distinguishes document writes from reads", async () => {
+  const { activityForCommand } = await loadPluginHelpers();
+  const write = activityForCommand("applyCopyUpdates");
+  assert.equal(write.mutating, true);
+  assert.equal(write.label, "Apply copy updates");
+  const read = activityForCommand("readFrameContent");
+  assert.equal(read.mutating, false);
+  assert.equal(read.label, "Read frame content");
 });
 
 function styledText(id, characters, parent) {

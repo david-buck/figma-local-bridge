@@ -4,21 +4,59 @@
     <meta charset="utf-8">
     <style>
       body { font: 12px Inter, sans-serif; margin: 16px; color: #1e1e1e; }
-      #status { color: #666; line-height: 1.5; } .connected { color: #14804a !important; } .waiting { color: #8a5b00 !important; }
+      .state { display: grid; grid-template-columns: 10px 1fr; gap: 10px; align-items: start; }
+      .dot { width: 8px; height: 8px; margin-top: 4px; border-radius: 50%; background: #8a8a8a; }
+      #status { font-weight: 600; line-height: 1.35; }
+      #detail { margin-top: 3px; color: #666; line-height: 1.4; overflow-wrap: anywhere; }
+      .connected .dot, .complete .dot { background: #14804a; }
+      .waiting .dot, .failed .dot { background: #b15c00; }
+      .reading .dot { background: #1677c8; animation: pulse 1s ease-in-out infinite; }
+      .editing .dot { background: #8b5cf6; animation: pulse .8s ease-in-out infinite; }
+      @keyframes pulse { 50% { opacity: .35; transform: scale(.82); } }
     </style>
   </head>
   <body>
-    <div id="status">Connecting to your local Codex bridge…</div>
+    <div id="state" class="state waiting" role="status" aria-live="polite">
+      <span class="dot"></span>
+      <div><div id="status">Connecting to local MCP bridge…</div><div id="detail"></div></div>
+    </div>
     <script>
+      const state = document.getElementById("state");
       const status = document.getElementById("status");
-      function showStatus(message, kind = "") {
+      const detail = document.getElementById("detail");
+      let connectedMessage = "Connected to local MCP bridge.";
+      let resetTimer;
+      function showStatus(message, kind = "", supportingText = "") {
+        clearTimeout(resetTimer);
         status.textContent = message;
-        status.className = kind;
+        detail.textContent = supportingText;
+        state.className = `state ${kind}`;
+      }
+      function showConnected() {
+        showStatus("Connected", "connected", connectedMessage);
       }
       window.onmessage = async (event) => {
         const message = event.data.pluginMessage;
         if (message?.type === "bridge-status") {
-          showStatus(message.message, message.kind);
+          if (message.kind === "connected") {
+            connectedMessage = message.message;
+            showConnected();
+          } else {
+            showStatus(message.message, message.kind);
+          }
+        }
+        if (message?.type === "bridge-activity") {
+          if (message.phase === "start") {
+            showStatus(message.mutating ? "MCP is making changes…" : "MCP is reading…", message.mutating ? "editing" : "reading", message.label);
+          } else {
+            const success = message.ok === true;
+            showStatus(
+              success ? (message.mutating ? "Change complete" : "Read complete") : (message.mutating ? "Change failed" : "Read failed"),
+              success ? "complete" : "failed",
+              success ? message.label : `${message.label}: ${message.error || "Unknown error"}`,
+            );
+            resetTimer = setTimeout(showConnected, success ? 900 : 2200);
+          }
         }
       };
       parent.postMessage({ pluginMessage: { type: "start" } }, "*");
