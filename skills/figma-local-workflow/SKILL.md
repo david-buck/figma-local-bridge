@@ -1,6 +1,6 @@
 ---
 name: figma-local-workflow
-description: Use the local figma_local MCP bridge to inspect, analyse, edit, copy-sync, re-layout, compose, archive, style, use design-system components and confirmed user preferences, add approved images to, or export the Figma Design file currently open in Figma Desktop. Trigger for requests to review artboards or spreads, sync copy with an external source, read or revise copy, inspect or replace layouts, use linked components/styles/tokens, audit text overflow, export frame PNGs, or make controlled canvas changes through the Local MCP Bridge plugin.
+description: Use the local figma_local MCP bridge to inspect, analyse, edit, copy-sync, re-layout, compose, archive, style, use design-system components and confirmed user preferences, read or write review comments, add approved images to, or export the Figma Design file currently open in Figma Desktop. Trigger for requests to review artboards, spreads or comments, sync copy with an external source, read or revise copy, inspect or replace layouts, use linked components/styles/tokens, audit text overflow, export frame PNGs, or make controlled canvas changes through the Local MCP Bridge plugin.
 ---
 
 # Local Figma workflow
@@ -11,15 +11,16 @@ Use an inspect-first sequence. Do not begin by querying arbitrary page nodes or 
 
 1. Call `figma_bridge_status`. Continue only when exactly one plugin is connected, and use its reported page name to confirm the expected Figma context.
 2. Call `figma_get_user_preferences` before choosing components, styles, tokens, typography, layout conventions, or copy patterns. Treat only returned confirmed preferences as durable user guidance.
-3. Call `figma_list_design_system_assets`, then `figma_list_artboards`. Discover verified component/style/token candidates and stable artboard IDs; never guess IDs or recreate an appropriate available component. If the relevant artboard is absent, call `figma_list_pages`, navigate with `figma_navigate_to_page`, then repeat discovery.
-4. Identify the relevant artboard or page pair:
+3. When review feedback is relevant, call `figma_comment_status`, then `figma_list_comments` before editing. Comment access is optional; if it is unavailable, report the missing REST setup without blocking unrelated canvas work.
+4. Call `figma_list_design_system_assets`, then `figma_list_artboards`. Discover verified component/style/token candidates and stable artboard IDs; never guess IDs or recreate an appropriate available component. If the relevant artboard is absent, call `figma_list_pages`, navigate with `figma_navigate_to_page`, then repeat discovery.
+5. Identify the relevant artboard or page pair:
    - Call `figma_read_frame_content` with `detail: summary` for one artboard.
    - Call `figma_read_spread_content` with `detail: summary` for a spread, passing `nodeIds` in the order returned by `figma_list_artboards`.
    - Request `detail: full` only when hierarchy or hidden variants are needed.
-5. For routine copy-only work, use the structured read and `figma_audit_text_overflow`; do not export or screenshot by default. Export or screenshot only when layout, imagery, geometry or uncertain wrapping needs visual judgement.
-6. Analyse copy and layout before proposing or making changes. Call `figma_audit_text_overflow` when text fit, truncation, clipping, or typography may matter.
-7. Only then edit identified nodes. Prefer the narrowest appropriate mutation tool and preserve unrelated content.
-8. Verify after editing:
+6. For routine copy-only work, use the structured read and `figma_audit_text_overflow`; do not export or screenshot by default. Export or screenshot only when layout, imagery, geometry or uncertain wrapping needs visual judgement.
+7. Analyse copy and layout before proposing or making changes. Call `figma_audit_text_overflow` when text fit, truncation, clipping, or typography may matter.
+8. Only then edit identified nodes. Prefer the narrowest appropriate mutation tool and preserve unrelated content.
+9. Verify after editing:
    - Re-read affected frame or spread content.
    - Re-run the overflow audit when text or dimensions changed.
    - Capture a screenshot only for uncertain wraps, adjacency or visual hierarchy; export a PNG only for a full-page/layout review, imagery or retained comparison.
@@ -27,6 +28,16 @@ Use an inspect-first sequence. Do not begin by querying arbitrary page nodes or 
 ## Fast review path
 
 After artboard discovery, use `figma_prepare_review` only for a visual page/spread review. It performs the read, local PNG exports, and optional overflow audits in that order without editing. For copy reconciliation, prefer `figma_read_copy` and overflow auditing so routine work does not consume image tokens.
+
+## Review comments
+
+Comments use Figma's REST API rather than the live plugin connection. Canvas tools remain token-free; `figma_comment_status` reports whether the optional token and file key are configured without revealing the token.
+
+- List comments before editing when the user refers to review feedback. Preserve returned comment IDs, parent IDs, author, resolved state, node/canvas position and timestamps as source data.
+- Post a root comment only at a verified frame ID or explicit canvas coordinates. Reply using the identified root comment ID; do not invent a thread relationship.
+- The API does not offer edit or resolve operations through this bridge. Never claim a comment was edited or resolved. Post a correction/reply or ask the user to resolve it in Figma.
+- Delete only a comment the user explicitly identifies, and pass the deletion confirmation guard. Deletion is permanent.
+- Re-list comments after a write when verification matters. Treat a successful REST response as comment verification; it does not prove a canvas edit.
 
 ## Layout responsibility and evidence cost
 

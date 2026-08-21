@@ -13,11 +13,14 @@ const launchParentPid = process.ppid;
 const sessionFreshnessMs = 35_000;
 const replacedSessionRetentionMs = 5 * 60_000;
 const proxyHealthIntervalMs = 2_000;
-const bridgeVersion = "0.10.2";
+const bridgeVersion = "0.11.0";
 const exportDirectory = process.env.FIGMA_EXPORT_DIR ?? join(homedir(), "Pictures", "Figma MCP Exports");
 const preferencesDirectory = process.env.FIGMA_PREFERENCES_DIR ?? join(homedir(), ".figma-local-bridge");
 const preferencesPath = join(preferencesDirectory, "preferences.json");
 const preferencesLockPath = join(preferencesDirectory, "preferences.lock");
+const figmaAccessToken = process.env.FIGMA_ACCESS_TOKEN?.trim();
+const configuredFigmaFileKey = process.env.FIGMA_FILE_KEY?.trim();
+const figmaApiBaseUrl = (process.env.FIGMA_API_BASE_URL ?? "https://api.figma.com").replace(/\/$/, "");
 if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
   throw new Error("FIGMA_BRIDGE_PORT must be a valid TCP port.");
 }
@@ -113,6 +116,7 @@ function cleanSessionInfo(value) {
     editorType: cleanString(value.editorType, 40),
     pageId: cleanString(value.pageId),
     pageName: cleanString(value.pageName),
+    fileKey: cleanString(value.fileKey, 300),
     selectionCount: Number.isSafeInteger(value.selectionCount) && value.selectionCount >= 0 ? value.selectionCount : undefined,
   }).filter(([, item]) => item !== undefined));
 }
@@ -834,6 +838,125 @@ async function resolveDesignChoice(input) {
   };
 }
 
+function normalizeFigmaFileKey(value) {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (/^https?:\/\//i.test(trimmed)) {
+    let parsed;
+    try { parsed = new URL(trimmed); } catch { throw new Error("The Figma file URL is invalid."); }
+    if (!(parsed.hostname === "figma.com" || parsed.hostname.endsWith(".figma.com"))) throw new Error("The file URL must be a figma.com URL.");
+    const segments = parsed.pathname.split("/").filter(Boolean);
+    const typeIndex = segments.findIndex((segment) => ["design", "file", "proto", "board", "slides"].includes(segment));
+    if (typeIndex < 0 || !segments[typeIndex + 1]) throw new Error("The Figma file URL does not contain a file key.");
+    return segments[typeIndex + 1];
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(trimmed)) throw new Error("The Figma file key contains unsupported characters.");
+  return trimmed;
+}
+
+async function commentFileConfiguration(input = {}) {
+  if (input.fileKey) return { fileKey: normalizeFigmaFileKey(input.fileKey), source: "tool input" };
+  if (configuredFigmaFileKey) return { fileKey: normalizeFigmaFileKey(configuredFigmaFileKey), source: "FIGMA_FILE_KEY" };
+  try {
+    const status = await bridgeStatusForMcp();
+    if (status.plugin?.fileKey) return { fileKey: normalizeFigmaFileKey(status.plugin.fileKey), source: "connected private Figma plugin" };
+  } catch {
+    // Comment calls can still explain missing configuration when the canvas bridge is offline.
+  }
+  return { fileKey: null, source: null };
+}
+
+function requireFigmaCommentToken() {
+  if (!figmaAccessToken) throw new Error("Figma comments require FIGMA_ACCESS_TOKEN with file_comments:read and/or file_comments:write scope. Canvas tools remain token-free.");
+  return figmaAccessToken;
+}
+
+async function requireCommentFileKey(input) {
+  const configuration = await commentFileConfiguration(input);
+  if (!configuration.fileKey) throw new Error("A Figma file key is required for comments. Pass fileKey (a key or Figma file URL) or set FIGMA_FILE_KEY. Public plugins cannot read the current file key.");
+  return configuration;
+}
+
+async function figmaCommentsRequest(path, options = {}) {
+  const token = requireFigmaCommentToken();
+  let response;
+  try {
+    response = await fetch(`${figmaApiBaseUrl}${path}`, {
+      method: options.method ?? "GET",
+      headers: { "X-Figma-Token": token, ...(options.body ? { "content-type": "application/json" } : {}) },
+      ...(options.body ? { body: JSON.stringify(options.body) } : {}),
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (error) {
+    throw new Error(`Figma comments request failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const text = await response.text();
+  let data = null;
+  if (text) {
+    try { data = JSON.parse(text); } catch { data = { message: text.slice(0, 500) }; }
+  }
+  if (!response.ok) {
+    const detail = data?.err ?? data?.message ?? response.statusText;
+    const retryAfter = response.headers.get("retry-after");
+    throw new Error(`Figma comments API returned ${response.status}${detail ? `: ${detail}` : ""}${retryAfter ? `. Retry after ${retryAfter} seconds.` : ""}`);
+  }
+  return data;
+}
+
+function conciseComment(comment) {
+  return {
+    id: comment.id,
+    message: comment.message,
+    parentId: comment.parent_id ?? null,
+    user: comment.user ? { id: comment.user.id, handle: comment.user.handle, imageUrl: comment.user.img_url ?? null } : null,
+    createdAt: comment.created_at ?? null,
+    resolvedAt: comment.resolved_at ?? null,
+    orderId: comment.order_id ?? null,
+    clientMeta: comment.client_meta ?? null,
+    reactions: comment.reactions ?? [],
+  };
+}
+
+async function commentStatus(input) {
+  const configuration = await commentFileConfiguration(input);
+  return {
+    available: Boolean(figmaAccessToken && configuration.fileKey),
+    tokenConfigured: Boolean(figmaAccessToken),
+    fileKeyConfigured: Boolean(configuration.fileKey),
+    fileKey: configuration.fileKey,
+    fileKeySource: configuration.source,
+    requiredScopes: ["file_comments:read", "file_comments:write"],
+    note: "Figma comments use the REST API because the Plugin API cannot access file comments. Canvas tools remain local and token-free.",
+  };
+}
+
+async function listComments(input) {
+  const configuration = await requireCommentFileKey(input);
+  const data = await figmaCommentsRequest(`/v1/files/${encodeURIComponent(configuration.fileKey)}/comments?as_md=${input.asMarkdown ? "true" : "false"}`);
+  const query = input.query?.toLowerCase();
+  const comments = (data?.comments ?? [])
+    .filter((comment) => input.includeResolved || !comment.resolved_at)
+    .filter((comment) => !query || comment.message?.toLowerCase().includes(query) || comment.user?.handle?.toLowerCase().includes(query))
+    .slice(0, input.limit)
+    .map(conciseComment);
+  return { fileKey: configuration.fileKey, fileKeySource: configuration.source, count: comments.length, comments };
+}
+
+async function postComment(input) {
+  const configuration = await requireCommentFileKey(input);
+  const body = input.replyToCommentId
+    ? { message: input.message, comment_id: input.replyToCommentId }
+    : { message: input.message, client_meta: input.nodeId ? { node_id: input.nodeId, node_offset: { x: input.x ?? 0, y: input.y ?? 0 } } : { x: input.x, y: input.y } };
+  const comment = await figmaCommentsRequest(`/v1/files/${encodeURIComponent(configuration.fileKey)}/comments`, { method: "POST", body });
+  return { fileKey: configuration.fileKey, fileKeySource: configuration.source, comment: conciseComment(comment) };
+}
+
+async function deleteComment(input) {
+  const configuration = await requireCommentFileKey(input);
+  await figmaCommentsRequest(`/v1/files/${encodeURIComponent(configuration.fileKey)}/comments/${encodeURIComponent(input.commentId)}`, { method: "DELETE" });
+  return { fileKey: configuration.fileKey, fileKeySource: configuration.source, deletedCommentId: input.commentId };
+}
+
 const workflowInstructions = [
   "Use this server with the inspect-first $figma-local-workflow skill when available.",
   "For best first-pass results, always follow this order:",
@@ -841,6 +964,7 @@ const workflowInstructions = [
   "2. figma_get_user_preferences — load confirmed per-user design-system, component, style, token, typography, layout and copy preferences before choosing assets.",
   "3. figma_list_design_system_assets and figma_list_artboards — discover verified components/styles and clean artboard IDs; never guess IDs or redraw an available appropriate component.",
   "4. figma_read_frame_content or figma_read_spread_content — read the relevant copy with hierarchy before editing.",
+  "When review feedback matters, call figma_comment_status and figma_list_comments before editing. Comments require optional REST credentials; canvas tools remain token-free.",
   "Use detail=summary for routine reads and overflow audits; request full only when hierarchy or hidden variants are needed.",
   "For source-to-Figma copy sync, use figma_read_copy for compact IDs/copy/bounds, diff outside Figma, then use figma_apply_copy_updates for narrow writes plus audit/export verification.",
   "5. figma_export_frame_png — inspect each relevant artboard visually from its returned local path.",
@@ -868,6 +992,55 @@ server.registerTool("figma_bridge_status", {
   inputSchema: {},
 }, async () => {
   try { return output(await bridgeStatusForMcp()); } catch (error) { return failure(error); }
+});
+
+server.registerTool("figma_comment_status", {
+  title: "Check Figma comment access",
+  description: "Check whether optional REST credentials and a file key are available for comment tools. Does not reveal the token or call Figma. Pass a Figma file key or URL when the public plugin cannot identify the current file.",
+  inputSchema: { fileKey: z.string().trim().min(1).max(1_000).optional() },
+}, async (input) => {
+  try { return output(await commentStatus(input)); } catch (error) { return failure(error); }
+});
+
+server.registerTool("figma_list_comments", {
+  title: "Read Figma comments",
+  description: "Read comments and replies from a Figma file through the optional REST API connection. Returns concise IDs, authors, messages, timestamps, resolution state, reactions, parent IDs and pin metadata. Canvas access alone cannot read comments.",
+  inputSchema: {
+    fileKey: z.string().trim().min(1).max(1_000).optional().describe("Figma file key or full figma.com file URL. Omit when FIGMA_FILE_KEY or a private plugin file key is available."),
+    asMarkdown: z.boolean().default(true),
+    includeResolved: z.boolean().default(false),
+    query: z.string().trim().min(1).max(500).optional(),
+    limit: z.number().int().min(1).max(1_000).default(250),
+  },
+}, async (input) => {
+  try { return output(await listComments(input)); } catch (error) { return failure(error); }
+});
+
+server.registerTool("figma_post_comment", {
+  title: "Post or reply to a Figma comment",
+  description: "Post a pinned root comment or reply to an existing root comment through Figma's REST API. For a root comment, provide a frame node ID (offset defaults to its top-left) or explicit canvas x/y coordinates. This cannot edit or resolve an existing comment.",
+  inputSchema: z.object({
+    fileKey: z.string().trim().min(1).max(1_000).optional().describe("Figma file key or full figma.com file URL."),
+    message: z.string().trim().min(1).max(10_000),
+    replyToCommentId: z.string().trim().min(1).max(300).optional(),
+    nodeId: nodeId.optional().describe("Frame node ID for a root comment pin."),
+    x: z.number().finite().min(-1_000_000).max(1_000_000).optional(),
+    y: z.number().finite().min(-1_000_000).max(1_000_000).optional(),
+  }).refine((input) => input.replyToCommentId || input.nodeId || (input.x !== undefined && input.y !== undefined), "A root comment requires nodeId or both x and y; a reply requires replyToCommentId."),
+}, async (input) => {
+  try { return output(await postComment(input)); } catch (error) { return failure(error); }
+});
+
+server.registerTool("figma_delete_comment", {
+  title: "Delete a Figma comment",
+  description: "Permanently delete a Figma comment through the REST API. Figma permits deletion only when the authenticated user created the comment. Call only after the user explicitly requests deletion.",
+  inputSchema: {
+    confirmed: z.literal(true),
+    fileKey: z.string().trim().min(1).max(1_000).optional().describe("Figma file key or full figma.com file URL."),
+    commentId: z.string().trim().min(1).max(300),
+  },
+}, async (input) => {
+  try { return output(await deleteComment(input)); } catch (error) { return failure(error); }
 });
 
 server.registerTool("figma_get_user_preferences", {

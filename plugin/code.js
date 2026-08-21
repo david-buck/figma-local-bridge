@@ -2,7 +2,7 @@ figma.showUI(__html__, { width: 360, height: 250, title: "Local MCP Bridge" });
 
 let bridgeGeneration = 0;
 const bridgeUrl = "http://localhost:3846";
-const pluginVersion = "0.10.2";
+const pluginVersion = "0.11.0";
 const bridgeClientId = `figma-client-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const mutatingCommands = new Set([
   "moveResizeReparent", "updateText", "deleteNode", "duplicateNode",
@@ -68,6 +68,7 @@ function bridgeContext() {
     editorType: figma.editorType,
     pageId: figma.currentPage.id,
     pageName: figma.currentPage.name,
+    fileKey: typeof figma.fileKey === "string" ? figma.fileKey : undefined,
     selectionCount: figma.currentPage.selection.length,
   };
 }

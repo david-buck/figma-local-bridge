@@ -1,6 +1,6 @@
 # Local Figma MCP bridge
 
-This is a small, local-only bridge between an MCP client and a Figma plugin. It does not use the Figma REST API or Figma's hosted MCP server. The Figma plugin must be open in the file you intend to edit; it uses Figma's Plugin API under your own active Figma session.
+This is a small bridge between an MCP client and a Figma plugin running on your own Mac. The Figma plugin must be open in the file you intend to edit; canvas work uses Figma's Plugin API under your active Figma session, without an API key. Optional comment tools use Figma's REST API because comments are not exposed to plugins.
 
 The repository is a dual Codex/Claude package:
 
@@ -45,6 +45,7 @@ cd figma-local-bridge
 - Discover verified local and currently used library components/styles, create linked component instances, and apply named styles by ID or key.
 - Store explicit per-user design-system preferences locally, query/update/revert them through the LLM, and return a no-edit clarification result when plausible systems tie.
 - Copy/crop an existing Figma image fill or place an explicitly approved local PNG/JPEG/GIF/WebP file.
+- List review comments, post a pinned comment or reply, and explicitly delete a comment through Figma's REST API.
 
 It deliberately binds only to `127.0.0.1` and accepts only one open Figma file at a time. It does not accept arbitrary JavaScript. SVG imports reject scripts, event handlers, iframes, and `foreignObject` elements.
 
@@ -80,6 +81,12 @@ args = ["/ABSOLUTE/PATH/TO/figma-local-bridge/dist/server.mjs"]
 
 Start a new Codex task after installing or updating the plugin so its skills and MCP tool definitions are loaded.
 
+### Optional comment setup
+
+Figma does not expose comments to its Plugin API, so comment tools are the one part of the bridge that needs REST credentials. Create a Figma personal access token with `file_comments:read`; add `file_comments:write` if you also want to post, reply, or delete. Set it privately as `FIGMA_ACCESS_TOKEN` in the MCP server environment—never in the repository.
+
+Set `FIGMA_FILE_KEY` as a convenient default, or pass a Figma file URL or key to each comment tool. A normal development or public plugin cannot reliably supply the current file key, so an explicit key is expected. `figma_comment_status` tells you whether the token and file key are available without exposing the token.
+
 ## Use with Claude
 
 The MCP tools work with Claude because the bridge uses standard stdio MCP rather than a Codex-specific protocol.
@@ -113,12 +120,13 @@ For a human-readable connection check, open [http://localhost:3846/](http://loca
 The MCP advertises this sequence in its server instructions, and the companion personal skill at `~/.codex/skills/figma-local-workflow` reinforces it:
 
 1. `figma_bridge_status`, then `figma_get_user_preferences`
-2. `figma_list_design_system_assets`, then `figma_list_artboards`
-3. `figma_read_frame_content` or `figma_read_spread_content`
-4. `figma_export_frame_png`
-5. Analyse copy and layout together; run `figma_audit_text_overflow` when fit matters
-6. Only then edit identified nodes
-7. Re-read, re-audit, and re-export after editing
+2. When review feedback is in scope, `figma_comment_status`, then `figma_list_comments`
+3. `figma_list_design_system_assets`, then `figma_list_artboards`
+4. `figma_read_frame_content` or `figma_read_spread_content`
+5. Export only when visual judgement is needed
+6. Analyse copy and layout together; run `figma_audit_text_overflow` when fit matters
+7. Only then edit identified nodes
+8. Re-read and re-audit; re-export only when the change needs visual verification
 
 After artboard discovery, `figma_prepare_review` is the faster equivalent for one to eight known artboards. It performs steps 2–4 in order, writes each PNG locally, and does not edit the file.
 
@@ -196,6 +204,9 @@ The bridge keeps its command surface intentionally narrow. It exposes the follow
 - `figma_get_user_preferences` / `figma_set_user_preference` / `figma_delete_user_preference` / `figma_revert_user_preferences` — manage explicit, revision-guarded per-user design-system guidance.
 - `figma_resolve_design_choice` — score candidates against confirmed scoped preferences and require clarification rather than guessing when they tie.
 - `figma_copy_image_fill` / `figma_place_local_image` — reuse/crop an existing Figma image or place an explicitly approved local raster image.
+- `figma_comment_status` / `figma_list_comments` — check optional REST setup and read file comments, with resolved comments excluded by default.
+- `figma_post_comment` — post a canvas- or frame-pinned comment, or reply to an existing comment.
+- `figma_delete_comment` — permanently delete one identified comment behind an explicit confirmation guard.
 
 For brand assets, read a trusted SVG file locally and pass its content to `figma_import_svg`; do not redraw logo artwork as text or paths.
 
@@ -205,6 +216,8 @@ When a prompt names colours, call `figma_create_color_tokens` before creating ar
 
 ## Security model
 
-The bridge listens only on localhost (`127.0.0.1`), so it is not reachable over your network. Browser requests are accepted only without an Origin header or from Figma origins; unrelated web pages cannot use its CORS surface. It intentionally removes the former shared token to make the local Figma workflow frictionless. Other local processes running as you on this Mac could still call its port while Codex is open, so do not use it on a shared, untrusted Mac.
+The canvas bridge listens only on localhost (`127.0.0.1`), so it is not reachable over your network. Browser requests are accepted only without an Origin header or from Figma origins; unrelated web pages cannot use its CORS surface. It intentionally removes the former shared bridge token to make the local Figma workflow frictionless. Other local processes running as you on this Mac could still call its port while Codex is open, so do not use it on a shared, untrusted Mac.
+
+If comment support is enabled, the server sends `FIGMA_ACCESS_TOKEN` only to Figma's configured API endpoint in an `X-Figma-Token` header. It never sends the token to the Figma plugin or includes it in tool output. Keep the token in private MCP environment configuration and grant only the comment scopes you need. Canvas tools continue to work without it.
 
 The preference store is created with user-only file permissions. It contains guidance you explicitly ask the LLM to remember, not Figma document contents. No preference is learned or written automatically.

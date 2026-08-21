@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import http from "node:http";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -83,11 +84,49 @@ function toolJson(result) {
 
 test("bridge advertises and orchestrates review and copy-sync workflows", async (context) => {
   const port = await freePort();
+  const commentsPort = await freePort();
   const exportDirectory = await mkdtemp(join(tmpdir(), "figma-local-bridge-test-"));
   const preferencesDirectory = await mkdtemp(join(tmpdir(), "figma-local-bridge-preferences-test-"));
+  const commentRequests = [];
+  const commentsApi = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const bodyText = Buffer.concat(chunks).toString("utf8");
+    const body = bodyText ? JSON.parse(bodyText) : null;
+    commentRequests.push({ method: request.method, url: request.url, token: request.headers["x-figma-token"], body });
+    if (request.method === "GET" && request.url === "/v1/files/test-file/comments?as_md=true") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ comments: [
+        { id: "comment-1", message: "Tighten this heading", user: { id: "user-1", handle: "Reviewer" }, created_at: "2026-08-21T00:00:00Z", client_meta: { node_id: "1:1", node_offset: { x: 12, y: 16 } } },
+        { id: "comment-2", parent_id: "comment-1", message: "Agreed", user: { id: "user-2", handle: "Editor" }, created_at: "2026-08-21T00:01:00Z" },
+        { id: "comment-3", message: "Already fixed", resolved_at: "2026-08-21T00:02:00Z", user: { id: "user-1", handle: "Reviewer" } },
+      ] }));
+      return;
+    }
+    if (request.method === "POST" && request.url === "/v1/files/test-file/comments") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ id: "comment-new", message: body.message, parent_id: body.comment_id, user: { id: "test-user", handle: "Test user" }, client_meta: body.client_meta, created_at: "2026-08-21T00:03:00Z" }));
+      return;
+    }
+    if (request.method === "DELETE" && request.url === "/v1/files/test-file/comments/comment-new") {
+      response.writeHead(204);
+      response.end();
+      return;
+    }
+    response.writeHead(404, { "content-type": "application/json" });
+    response.end(JSON.stringify({ err: "Not found" }));
+  });
+  await new Promise((resolve, reject) => {
+    commentsApi.once("error", reject);
+    commentsApi.listen(commentsPort, "127.0.0.1", resolve);
+  });
   const child = spawn(process.execPath, [new URL("../server.mjs", import.meta.url).pathname], {
     cwd: new URL("../..", import.meta.url).pathname,
-    env: { ...process.env, FIGMA_BRIDGE_PORT: String(port), FIGMA_EXPORT_DIR: exportDirectory, FIGMA_PREFERENCES_DIR: preferencesDirectory },
+    env: {
+      ...process.env,
+      FIGMA_BRIDGE_PORT: String(port), FIGMA_EXPORT_DIR: exportDirectory, FIGMA_PREFERENCES_DIR: preferencesDirectory,
+      FIGMA_ACCESS_TOKEN: "test-token", FIGMA_FILE_KEY: "test-file", FIGMA_API_BASE_URL: `http://127.0.0.1:${commentsPort}`,
+    },
     stdio: ["pipe", "pipe", "pipe"],
   });
   let stderr = "";
@@ -104,6 +143,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     }
     await rm(exportDirectory, { recursive: true, force: true });
     await rm(preferencesDirectory, { recursive: true, force: true });
+    await new Promise((resolve) => commentsApi.close(resolve));
   });
 
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -119,7 +159,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     capabilities: {},
     clientInfo: { name: "figma-bridge-test", version: "1.0.0" },
   });
-  assert.equal(initialized.serverInfo.version, "0.10.2");
+  assert.equal(initialized.serverInfo.version, "0.11.0");
   assert.match(initialized.instructions, /figma_prepare_review/);
   assert.match(initialized.instructions, /figma_apply_copy_updates/);
   rpc.notify("notifications/initialized");
@@ -131,10 +171,42 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     "figma_archive_nodes", "figma_supersede_layout", "figma_compose_frame", "figma_copy_style_from_node", "figma_list_page_tokens", "figma_copy_image_fill", "figma_place_local_image",
     "figma_get_user_preferences", "figma_set_user_preference", "figma_delete_user_preference", "figma_revert_user_preferences", "figma_resolve_design_choice",
     "figma_list_design_system_assets", "figma_create_component_instance", "figma_apply_design_style",
+    "figma_comment_status", "figma_list_comments", "figma_post_comment", "figma_delete_comment",
   ]) {
     assert.ok(toolNames.has(name), `${name} should be advertised`);
   }
   assert.equal(toolJson(await rpc.request("tools/call", { name: "figma_bridge_status", arguments: {} })).connected, false);
+
+  const commentStatus = toolJson(await rpc.request("tools/call", { name: "figma_comment_status", arguments: {} }));
+  assert.equal(commentStatus.available, true);
+  assert.equal(commentStatus.fileKeySource, "FIGMA_FILE_KEY");
+  const urlCommentStatus = toolJson(await rpc.request("tools/call", {
+    name: "figma_comment_status",
+    arguments: { fileKey: "https://www.figma.com/design/url-key/Example" },
+  }));
+  assert.equal(urlCommentStatus.fileKey, "url-key");
+  assert.equal(urlCommentStatus.fileKeySource, "tool input");
+  const comments = toolJson(await rpc.request("tools/call", { name: "figma_list_comments", arguments: {} }));
+  assert.equal(comments.count, 2);
+  assert.equal(comments.comments[1].parentId, "comment-1");
+  const postedComment = toolJson(await rpc.request("tools/call", {
+    name: "figma_post_comment",
+    arguments: { message: "Please check this frame", nodeId: "1:1", x: 20, y: 30 },
+  }));
+  assert.equal(postedComment.comment.id, "comment-new");
+  assert.deepEqual(commentRequests.at(-1).body.client_meta, { node_id: "1:1", node_offset: { x: 20, y: 30 } });
+  const reply = toolJson(await rpc.request("tools/call", {
+    name: "figma_post_comment",
+    arguments: { message: "Updated", replyToCommentId: "comment-1" },
+  }));
+  assert.equal(reply.comment.parentId, "comment-1");
+  assert.equal(commentRequests.at(-1).body.comment_id, "comment-1");
+  const deletedComment = toolJson(await rpc.request("tools/call", {
+    name: "figma_delete_comment",
+    arguments: { confirmed: true, commentId: "comment-new" },
+  }));
+  assert.equal(deletedComment.deletedCommentId, "comment-new");
+  assert.ok(commentRequests.every((request) => request.token === "test-token"));
 
   const initialPreferences = toolJson(await rpc.request("tools/call", { name: "figma_get_user_preferences", arguments: {} }));
   assert.equal(initialPreferences.revision, 0);
@@ -221,7 +293,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     capabilities: {},
     clientInfo: { name: "figma-bridge-proxy-test", version: "1.0.0" },
   });
-  assert.equal(proxyInitialized.serverInfo.version, "0.10.2");
+  assert.equal(proxyInitialized.serverInfo.version, "0.11.0");
   proxyRpc.notify("notifications/initialized");
   const proxyStatus = toolJson(await proxyRpc.request("tools/call", { name: "figma_bridge_status", arguments: {} }));
   assert.equal(proxyStatus.connected, true);
