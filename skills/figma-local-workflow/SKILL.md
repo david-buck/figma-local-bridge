@@ -33,6 +33,8 @@ After artboard discovery, use `figma_prepare_review` only for a visual page/spre
 
 Comments use Figma's REST API rather than the live plugin connection. Canvas tools remain token-free; `figma_comment_status` reports whether the optional token and file key are configured without revealing the token.
 
+- If comment access is unavailable, direct the user to **Figma API access** in the connected plugin. Never ask them to paste a token into chat or an MCP tool call. The plugin can save it to secure OS storage and verify read access; write access is verified only by an intentional comment write.
+
 - List comments before editing when the user refers to review feedback. Preserve returned comment IDs, parent IDs, author, resolved state, node/canvas position and timestamps as source data.
 - Post a root comment only at a verified frame ID or explicit canvas coordinates. Reply using the identified root comment ID; do not invent a thread relationship.
 - The API does not offer edit or resolve operations through this bridge. Never claim a comment was edited or resolved. Post a correction/reply or ask the user to resolve it in Figma.

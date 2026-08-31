@@ -1,6 +1,6 @@
 # Local Figma MCP bridge
 
-This is a small bridge between an MCP client and a Figma plugin running on your own Mac. The Figma plugin must be open in the file you intend to edit; canvas work uses Figma's Plugin API under your active Figma session, without an API key. Optional comment tools use Figma's REST API because comments are not exposed to plugins.
+This is a small bridge between an MCP client and a Figma plugin running on your own computer. The Figma plugin must be open in the file you intend to edit; canvas work uses Figma's Plugin API under your active Figma session, without an API key. Optional comment tools use Figma's REST API because comments are not exposed to plugins.
 
 The repository is a dual Codex/Claude package:
 
@@ -83,9 +83,11 @@ Start a new Codex task after installing or updating the plugin so its skills and
 
 ### Optional comment setup
 
-Figma does not expose comments to its Plugin API, so comment tools are the one part of the bridge that needs REST credentials. Create a Figma personal access token with `file_comments:read`; add `file_comments:write` if you also want to post, reply, or delete. Set it privately as `FIGMA_ACCESS_TOKEN` in the MCP server environment—never in the repository.
+Figma does not expose comments to its Plugin API, so comment tools are the one part of the bridge that needs REST credentials. Open **Figma API access** in the connected plugin, paste a personal access token and the file URL, then choose **Save & test**. Grant `file_comments:read`; add `file_comments:write` if you also want to post, reply, or delete.
 
-Set `FIGMA_FILE_KEY` as a convenient default, or pass a Figma file URL or key to each comment tool. A normal development or public plugin cannot reliably supply the current file key, so an explicit key is expected. `figma_comment_status` tells you whether the token and file key are available without exposing the token.
+The bridge saves the token in macOS Keychain, Windows user-scoped DPAPI encryption, or Linux Secret Service. If secure system storage is unavailable, it says so and keeps the token only for the current bridge session—there is no plaintext fallback. The plugin immediately clears the password field and never puts the token in the Figma document, plugin storage, logs, or MCP output.
+
+**Save & test** safely verifies comment-read access against the chosen file. Figma does not provide scope introspection, so write access remains “not tested” until you intentionally post a comment. As an advanced alternative, set `FIGMA_ACCESS_TOKEN` and `FIGMA_FILE_KEY` privately in the MCP server environment; environment-managed credentials cannot be changed in the plugin.
 
 ## Use with Claude
 
@@ -217,8 +219,8 @@ When a prompt names colours, call `figma_create_color_tokens` before creating ar
 
 ## Security model
 
-The canvas bridge listens only on localhost (`127.0.0.1`), so it is not reachable over your network. Browser requests are accepted only without an Origin header or from Figma origins; unrelated web pages cannot use its CORS surface. It intentionally removes the former shared bridge token to make the local Figma workflow frictionless. Other local processes running as you on this Mac could still call its port while Codex is open, so do not use it on a shared, untrusted Mac.
+The canvas bridge listens only on localhost (`127.0.0.1`), so it is not reachable over your network. Browser requests are accepted only without an Origin header or from Figma origins; unrelated web pages cannot use its CORS surface. It intentionally removes the former shared bridge token to make the local Figma workflow frictionless. Other local processes running as your OS user could still call its port while the MCP is open, so do not use it on a shared, untrusted computer.
 
-If comment support is enabled, the server sends `FIGMA_ACCESS_TOKEN` only to Figma's configured API endpoint in an `X-Figma-Token` header. It never sends the token to the Figma plugin or includes it in tool output. Keep the token in private MCP environment configuration and grant only the comment scopes you need. Canvas tools continue to work without it.
+If comment support is enabled, the server sends the saved token only to Figma's configured API endpoint in an `X-Figma-Token` header. The plugin UI passes a newly entered token directly to the authenticated localhost bridge, clears the field immediately, and never sends it through the plugin main thread or stores it in the Figma document. Secure storage is macOS Keychain, Windows CurrentUser DPAPI, or Linux Secret Service; when none is usable, the UI reports a session-only fallback. Environment variables remain available for managed setups. Grant only the comment scopes you need. Canvas tools continue to work without a token.
 
 The preference store is created with user-only file permissions. It contains guidance you explicitly ask the LLM to remember, not Figma document contents. No preference is learned or written automatically.

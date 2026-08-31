@@ -6,6 +6,7 @@ import { isAbsolute, join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { createCredentialStore } from "./credential-store.mjs";
 
 const host = process.env.FIGMA_BRIDGE_HOST ?? "127.0.0.1";
 const port = Number.parseInt(process.env.FIGMA_BRIDGE_PORT ?? "3846", 10);
@@ -13,14 +14,16 @@ const launchParentPid = process.ppid;
 const sessionFreshnessMs = 35_000;
 const replacedSessionRetentionMs = 5 * 60_000;
 const proxyHealthIntervalMs = 2_000;
-const bridgeVersion = "0.11.1";
+const bridgeVersion = "0.12.0";
 const exportDirectory = process.env.FIGMA_EXPORT_DIR ?? join(homedir(), "Pictures", "Figma MCP Exports");
 const preferencesDirectory = process.env.FIGMA_PREFERENCES_DIR ?? join(homedir(), ".figma-local-bridge");
 const preferencesPath = join(preferencesDirectory, "preferences.json");
 const preferencesLockPath = join(preferencesDirectory, "preferences.lock");
-const figmaAccessToken = process.env.FIGMA_ACCESS_TOKEN?.trim();
+const apiSettingsPath = join(preferencesDirectory, "api-settings.json");
+const environmentFigmaAccessToken = process.env.FIGMA_ACCESS_TOKEN?.trim();
 const configuredFigmaFileKey = process.env.FIGMA_FILE_KEY?.trim();
 const figmaApiBaseUrl = (process.env.FIGMA_API_BASE_URL ?? "https://api.figma.com").replace(/\/$/, "");
+const credentialStore = createCredentialStore({ directory: preferencesDirectory });
 if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
   throw new Error("FIGMA_BRIDGE_PORT must be a valid TCP port.");
 }
@@ -33,6 +36,7 @@ let stopping = false;
 let electionInFlight = false;
 let proxyHealthInFlight = false;
 let proxyHealthTimer = null;
+let lastApiCapabilityCheck = null;
 let resolveInitialBridgeRole;
 const initialBridgeRole = new Promise((resolve) => { resolveInitialBridgeRole = resolve; });
 
@@ -245,6 +249,28 @@ function addSession(body) {
   return session;
 }
 
+function authorizePluginSettings(sessionId, clientId) {
+  const session = getSession(sessionId);
+  if (!session || typeof clientId !== "string" || session.clientId !== clientId || !activeSessions().includes(session)) {
+    throw new Error("Reconnect the Figma plugin before changing API access.");
+  }
+  updateSession(session, {});
+  return session;
+}
+
+function validateInternalCommentRequest(body) {
+  const method = body.method ?? "GET";
+  if (!['GET', 'POST', 'DELETE'].includes(method)) throw new Error("Unsupported Figma comments method.");
+  if (typeof body.path !== "string" || body.path.length > 2_000) throw new Error("A valid Figma comments path is required.");
+  const parsed = new URL(body.path, "https://api.figma.com");
+  if (!/^\/v1\/files\/[^/]+\/comments(?:\/[^/]+)?$/.test(parsed.pathname)) throw new Error("Only Figma comment routes may be proxied.");
+  if ([...parsed.searchParams.keys()].some((key) => key !== "as_md")) throw new Error("Unsupported Figma comments query.");
+  const hasCommentId = parsed.pathname.split("/").filter(Boolean).length === 5;
+  if ((method === "GET" || method === "POST") && hasCommentId) throw new Error("This Figma comments method requires the file comments collection.");
+  if (method === "DELETE" && !hasCommentId) throw new Error("Deleting a Figma comment requires its ID.");
+  return { path: `${parsed.pathname}${parsed.search}`, method, body: body.body };
+}
+
 const bridge = http.createServer(async (request, response) => {
   const origin = request.headers.origin;
   if (!isAllowedBrowserOrigin(origin)) return json(response, 403, { error: "Browser origin is not permitted by this local bridge." });
@@ -255,6 +281,44 @@ const bridge = http.createServer(async (request, response) => {
   try {
     if (request.method === "GET" && url.pathname === "/") return html(response, 200, statusPage);
     if (request.method === "GET" && url.pathname === "/v1/status") return json(response, 200, bridgeStatusSnapshot());
+
+    if (request.method === "GET" && url.pathname === "/v1/api-credentials/status") {
+      authorizePluginSettings(url.searchParams.get("sessionId"), url.searchParams.get("clientId"));
+      return json(response, 200, await ownerApiCredentialStatus());
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/api-credentials/save") {
+      const body = await readJson(request);
+      authorizePluginSettings(body.sessionId, body.clientId);
+      return json(response, 200, await saveOwnerApiCredentials(body));
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/api-credentials/test") {
+      const body = await readJson(request);
+      authorizePluginSettings(body.sessionId, body.clientId);
+      const status = await ownerApiCredentialStatus();
+      if (!status.configured) throw new Error("Add a Figma API token before testing access.");
+      const fileKey = body.fileKey ? normalizeFigmaFileKey(body.fileKey) : status.defaultFileKey;
+      await testOwnerCommentAccess(fileKey);
+      return json(response, 200, await ownerApiCredentialStatus());
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/api-credentials/clear") {
+      const body = await readJson(request);
+      authorizePluginSettings(body.sessionId, body.clientId);
+      return json(response, 200, await clearOwnerApiCredentials());
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/api-credentials/internal-status") {
+      if (origin) return json(response, 403, { error: "Internal bridge route." });
+      return json(response, 200, await ownerApiCredentialStatus());
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/figma-rest/comments") {
+      if (origin) return json(response, 403, { error: "Internal bridge route." });
+      const operation = validateInternalCommentRequest(await readJson(request));
+      return json(response, 200, { data: await ownerFigmaCommentsRequest(operation.path, { method: operation.method, body: operation.body }) });
+    }
 
     if (request.method === "POST" && url.pathname === "/v1/mcp-command") {
       const body = await readJson(request);
@@ -838,6 +902,99 @@ async function resolveDesignChoice(input) {
   };
 }
 
+async function readApiSettings() {
+  let contents;
+  try { contents = await readFile(apiSettingsPath, "utf8"); } catch (error) {
+    if (error?.code === "ENOENT") return { defaultFileKey: null };
+    throw error;
+  }
+  try {
+    const parsed = JSON.parse(contents);
+    return { defaultFileKey: typeof parsed.defaultFileKey === "string" ? normalizeFigmaFileKey(parsed.defaultFileKey) : null };
+  } catch {
+    throw new Error("The local Figma API settings file is invalid. Remove it before saving new API settings.");
+  }
+}
+
+async function writeApiSettings(settings) {
+  await mkdir(preferencesDirectory, { recursive: true, mode: 0o700 });
+  const temporaryPath = join(preferencesDirectory, `api-settings.${process.pid}.${randomUUID()}.tmp`);
+  await writeFile(temporaryPath, `${JSON.stringify({ schemaVersion: 1, defaultFileKey: settings.defaultFileKey }, null, 2)}\n`, { mode: 0o600 });
+  await rename(temporaryPath, apiSettingsPath);
+}
+
+function validateFigmaAccessToken(value) {
+  if (typeof value !== "string" || value.length < 8 || value.length > 4_000 || /\s/.test(value)) {
+    throw new Error("Enter a valid Figma access token without spaces or line breaks.");
+  }
+  return value;
+}
+
+async function ownerCredentialToken() {
+  return environmentFigmaAccessToken || await credentialStore.get();
+}
+
+async function ownerApiCredentialStatus() {
+  const settings = await readApiSettings();
+  if (environmentFigmaAccessToken) {
+    return {
+      configured: true,
+      source: "environment",
+      storage: { backend: "environment", label: "MCP environment", persisted: true, managedExternally: true, warning: null },
+      defaultFileKey: configuredFigmaFileKey || settings.defaultFileKey,
+      defaultFileKeySource: configuredFigmaFileKey ? "FIGMA_FILE_KEY" : settings.defaultFileKey ? "plugin setup" : null,
+      capabilities: lastApiCapabilityCheck,
+    };
+  }
+  const storage = await credentialStore.status();
+  return {
+    configured: storage.configured,
+    source: storage.configured ? (storage.persisted ? "secure storage" : "session") : null,
+    storage: { ...storage, managedExternally: false },
+    defaultFileKey: configuredFigmaFileKey || settings.defaultFileKey,
+    defaultFileKeySource: configuredFigmaFileKey ? "FIGMA_FILE_KEY" : settings.defaultFileKey ? "plugin setup" : null,
+    capabilities: lastApiCapabilityCheck,
+  };
+}
+
+async function apiCredentialStatusForMcp() {
+  await initialBridgeRole;
+  if (bridgeRole === "owner") return ownerApiCredentialStatus();
+  return ownerRequest("/v1/api-credentials/internal-status");
+}
+
+async function testOwnerCommentAccess(fileKey) {
+  if (!fileKey) {
+    lastApiCapabilityCheck = { commentsRead: "not-tested", checkedAt: new Date().toISOString(), message: "Add a default Figma file URL or key to verify comment access." };
+    return lastApiCapabilityCheck;
+  }
+  try {
+    await ownerFigmaCommentsRequest(`/v1/files/${encodeURIComponent(fileKey)}/comments?as_md=true`);
+    lastApiCapabilityCheck = { commentsRead: "verified", commentsWrite: "not-tested", checkedAt: new Date().toISOString(), message: "Comment reading is verified for this file. Write access is tested only when you intentionally post a comment." };
+  } catch (error) {
+    lastApiCapabilityCheck = { commentsRead: "unavailable", commentsWrite: "not-tested", checkedAt: new Date().toISOString(), message: error instanceof Error ? error.message : "Figma comment access could not be verified." };
+  }
+  return lastApiCapabilityCheck;
+}
+
+async function saveOwnerApiCredentials(input) {
+  if (environmentFigmaAccessToken) throw new Error("FIGMA_ACCESS_TOKEN is managed by the MCP environment. Remove it there before switching to plugin-managed credentials.");
+  const accessToken = validateFigmaAccessToken(input.accessToken);
+  const defaultFileKey = input.fileKey ? normalizeFigmaFileKey(input.fileKey) : null;
+  const persistence = await credentialStore.set(accessToken);
+  await writeApiSettings({ defaultFileKey });
+  await testOwnerCommentAccess(defaultFileKey);
+  return { ...(await ownerApiCredentialStatus()), saved: true, persisted: persistence.persisted };
+}
+
+async function clearOwnerApiCredentials() {
+  if (environmentFigmaAccessToken) throw new Error("FIGMA_ACCESS_TOKEN is managed by the MCP environment and cannot be removed from the plugin.");
+  await credentialStore.delete();
+  await unlink(apiSettingsPath).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+  lastApiCapabilityCheck = null;
+  return { ...(await ownerApiCredentialStatus()), cleared: true };
+}
+
 function normalizeFigmaFileKey(value) {
   if (!value) return null;
   const trimmed = value.trim();
@@ -857,6 +1014,8 @@ function normalizeFigmaFileKey(value) {
 async function commentFileConfiguration(input = {}) {
   if (input.fileKey) return { fileKey: normalizeFigmaFileKey(input.fileKey), source: "tool input" };
   if (configuredFigmaFileKey) return { fileKey: normalizeFigmaFileKey(configuredFigmaFileKey), source: "FIGMA_FILE_KEY" };
+  const credentials = await apiCredentialStatusForMcp();
+  if (credentials.defaultFileKey) return { fileKey: normalizeFigmaFileKey(credentials.defaultFileKey), source: credentials.defaultFileKeySource };
   try {
     const status = await bridgeStatusForMcp();
     if (status.plugin?.fileKey) return { fileKey: normalizeFigmaFileKey(status.plugin.fileKey), source: "connected private Figma plugin" };
@@ -866,9 +1025,10 @@ async function commentFileConfiguration(input = {}) {
   return { fileKey: null, source: null };
 }
 
-function requireFigmaCommentToken() {
-  if (!figmaAccessToken) throw new Error("Figma comments require FIGMA_ACCESS_TOKEN with file_comments:read and/or file_comments:write scope. Canvas tools remain token-free.");
-  return figmaAccessToken;
+async function requireFigmaCommentToken() {
+  const token = await ownerCredentialToken();
+  if (!token) throw new Error("Figma comments require API access configured in the plugin or FIGMA_ACCESS_TOKEN with file_comments:read and/or file_comments:write scope. Canvas tools remain token-free.");
+  return token;
 }
 
 async function requireCommentFileKey(input) {
@@ -877,8 +1037,8 @@ async function requireCommentFileKey(input) {
   return configuration;
 }
 
-async function figmaCommentsRequest(path, options = {}) {
-  const token = requireFigmaCommentToken();
+async function ownerFigmaCommentsRequest(path, options = {}) {
+  const token = await requireFigmaCommentToken();
   let response;
   try {
     response = await fetch(`${figmaApiBaseUrl}${path}`, {
@@ -900,7 +1060,24 @@ async function figmaCommentsRequest(path, options = {}) {
     const retryAfter = response.headers.get("retry-after");
     throw new Error(`Figma comments API returned ${response.status}${detail ? `: ${detail}` : ""}${retryAfter ? `. Retry after ${retryAfter} seconds.` : ""}`);
   }
+  const checkedAt = new Date().toISOString();
+  if ((options.method ?? "GET") === "GET") {
+    lastApiCapabilityCheck = { ...(lastApiCapabilityCheck ?? {}), commentsRead: "verified", commentsWrite: lastApiCapabilityCheck?.commentsWrite ?? "not-tested", checkedAt, message: "Comment reading is verified for this file. Write access is tested only when you intentionally post or delete a comment." };
+  } else {
+    lastApiCapabilityCheck = { ...(lastApiCapabilityCheck ?? {}), commentsWrite: "verified", checkedAt, message: "Comment write access was verified by the completed action." };
+  }
   return data;
+}
+
+async function figmaCommentsRequest(path, options = {}) {
+  await initialBridgeRole;
+  if (bridgeRole === "owner") return ownerFigmaCommentsRequest(path, options);
+  const response = await ownerRequest("/v1/figma-rest/comments", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path, method: options.method ?? "GET", body: options.body }),
+  }, 35_000);
+  return response.data;
 }
 
 function conciseComment(comment) {
@@ -919,14 +1096,18 @@ function conciseComment(comment) {
 
 async function commentStatus(input) {
   const configuration = await commentFileConfiguration(input);
+  const credentials = await apiCredentialStatusForMcp();
   return {
-    available: Boolean(figmaAccessToken && configuration.fileKey),
-    tokenConfigured: Boolean(figmaAccessToken),
+    available: Boolean(credentials.configured && configuration.fileKey),
+    tokenConfigured: credentials.configured,
+    credentialSource: credentials.source,
+    storage: credentials.storage,
     fileKeyConfigured: Boolean(configuration.fileKey),
     fileKey: configuration.fileKey,
     fileKeySource: configuration.source,
     requiredScopes: ["file_comments:read", "file_comments:write"],
-    note: "Figma comments use the REST API because the Plugin API cannot access file comments. Canvas tools remain local and token-free.",
+    capabilities: credentials.capabilities,
+    note: "Figma comments use the REST API because the Plugin API cannot access file comments. Configure access in the plugin or MCP environment; canvas tools remain local and token-free.",
   };
 }
 
@@ -964,7 +1145,7 @@ const workflowInstructions = [
   "2. figma_get_user_preferences — load confirmed per-user design-system, component, style, token, typography, layout and copy preferences before choosing assets.",
   "3. figma_list_design_system_assets and figma_list_artboards — discover verified components/styles and clean artboard IDs; never guess IDs or redraw an available appropriate component.",
   "4. figma_read_frame_content or figma_read_spread_content — read the relevant copy with hierarchy before editing.",
-  "When review feedback matters, call figma_comment_status and figma_list_comments before editing. Comments require optional REST credentials; canvas tools remain token-free.",
+  "When review feedback matters, call figma_comment_status and figma_list_comments before editing. If access is unavailable, direct the user to Figma API access in the connected plugin; never ask for a token in chat or a tool call. Canvas tools remain token-free.",
   "Use detail=summary for routine reads and overflow audits; request full only when hierarchy or hidden variants are needed.",
   "For source-to-Figma copy sync, use figma_read_copy for compact IDs/copy/bounds, diff outside Figma, then use figma_apply_copy_updates for narrow writes plus audit/export verification.",
   "5. figma_export_frame_png — inspect each relevant artboard visually from its returned local path.",

@@ -3,16 +3,31 @@
   <head>
     <meta charset="utf-8">
     <style>
-      body { font: 12px Inter, sans-serif; margin: 16px; color: #1e1e1e; }
+      * { box-sizing: border-box; }
+      body { font: 12px/1.45 Inter, sans-serif; margin: 16px; color: #1e1e1e; }
       .state { display: grid; grid-template-columns: 10px 1fr; gap: 10px; align-items: start; }
       .dot { width: 8px; height: 8px; margin-top: 4px; border-radius: 50%; background: #8a8a8a; }
       #status { font-weight: 600; line-height: 1.35; }
-      #detail { margin-top: 3px; color: #666; line-height: 1.4; overflow-wrap: anywhere; }
+      #detail, .hint, #api-message { margin-top: 3px; color: #666; overflow-wrap: anywhere; }
       .connected .dot, .complete .dot { background: #14804a; }
       .waiting .dot, .failed .dot { background: #b15c00; }
       .reading .dot { background: #1677c8; animation: pulse 1s ease-in-out infinite; }
       .editing .dot { background: #8b5cf6; animation: pulse .8s ease-in-out infinite; }
       @keyframes pulse { 50% { opacity: .35; transform: scale(.82); } }
+      details { margin-top: 18px; padding-top: 14px; border-top: 1px solid #e5e5e5; }
+      summary { cursor: pointer; font-weight: 600; }
+      .api { padding-top: 12px; }
+      label { display: block; margin: 10px 0 4px; font-weight: 600; }
+      input { width: 100%; min-height: 32px; padding: 7px 8px; border: 1px solid #aaa; border-radius: 5px; background: #fff; color: #1e1e1e; }
+      .buttons { display: flex; gap: 7px; margin-top: 11px; }
+      button { min-height: 30px; padding: 6px 10px; border: 1px solid #aaa; border-radius: 5px; background: #fff; cursor: pointer; }
+      button.primary { border-color: #0d67d5; background: #0d67d5; color: #fff; }
+      button.danger { margin-left: auto; color: #a32727; }
+      button:disabled, input:disabled { cursor: default; opacity: .5; }
+      #api-state { margin-top: 12px; padding: 9px 10px; border-radius: 6px; background: #f3f3f3; }
+      #api-state strong { display: block; }
+      #api-message.error { color: #a32727; }
+      a { color: #0d67d5; }
     </style>
   </head>
   <body>
@@ -20,41 +35,131 @@
       <span class="dot"></span>
       <div><div id="status">Connecting to local MCP bridge…</div><div id="detail"></div></div>
     </div>
+
+    <details id="api-details">
+      <summary>Figma API access <span id="api-summary">— not configured</span></summary>
+      <div class="api">
+        <p class="hint">Optional. Enables review comments; all canvas tools remain token-free.</p>
+        <label for="access-token">Personal access token</label>
+        <input id="access-token" type="password" autocomplete="off" spellcheck="false" placeholder="figd_…">
+        <p class="hint">Grant <code>file_comments:read</code>, plus <code>file_comments:write</code> to post, reply, or delete.</p>
+        <label for="file-key">Default Figma file URL or key</label>
+        <input id="file-key" type="text" autocomplete="off" spellcheck="false" placeholder="https://www.figma.com/design/…">
+        <div class="buttons">
+          <button id="save" class="primary">Save &amp; test</button>
+          <button id="test">Test</button>
+          <button id="remove" class="danger">Remove</button>
+        </div>
+        <div id="api-state" aria-live="polite"><strong id="api-label">Waiting for bridge…</strong><span id="api-detail"></span></div>
+        <div id="api-message"></div>
+        <p class="hint">The token goes straight to the local bridge and is never stored in this Figma file. <a href="https://help.figma.com/hc/en-us/articles/8085703771159-Manage-personal-access-tokens" target="_blank">How to create a token</a></p>
+      </div>
+    </details>
+
     <script>
       const state = document.getElementById("state");
       const status = document.getElementById("status");
       const detail = document.getElementById("detail");
+      const tokenInput = document.getElementById("access-token");
+      const fileKeyInput = document.getElementById("file-key");
+      const saveButton = document.getElementById("save");
+      const testButton = document.getElementById("test");
+      const removeButton = document.getElementById("remove");
+      const apiSummary = document.getElementById("api-summary");
+      const apiLabel = document.getElementById("api-label");
+      const apiDetail = document.getElementById("api-detail");
+      const apiMessage = document.getElementById("api-message");
+      const apiDetails = document.getElementById("api-details");
+      let bridgeSession = null;
+      let externallyManaged = false;
       let connectedMessage = "Connected to local MCP bridge.";
       let resetTimer;
+
       function showStatus(message, kind = "", supportingText = "") {
         clearTimeout(resetTimer);
         status.textContent = message;
         detail.textContent = supportingText;
         state.className = `state ${kind}`;
       }
-      function showConnected() {
-        showStatus("Connected", "connected", connectedMessage);
+      function showConnected() { showStatus("Connected", "connected", connectedMessage); }
+      function setBusy(busy) {
+        saveButton.disabled = busy || !bridgeSession || externallyManaged;
+        testButton.disabled = busy || !bridgeSession;
+        removeButton.disabled = busy || !bridgeSession || externallyManaged;
       }
+      async function apiRequest(path, options = {}) {
+        const response = await fetch(`${bridgeSession.bridgeUrl}${path}`, options);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || `Bridge returned ${response.status}`);
+        return data;
+      }
+      function renderApiStatus(data) {
+        const managed = data.storage && data.storage.managedExternally;
+        externallyManaged = Boolean(managed);
+        apiSummary.textContent = data.configured ? "— configured" : "— not configured";
+        apiLabel.textContent = data.configured ? `Stored in ${data.storage.label}` : "No API token configured";
+        const capability = data.capabilities && data.capabilities.commentsRead;
+        const readState = capability === "verified" ? "Comment reading verified." : capability === "unavailable" ? "Comment reading unavailable." : "Comment access not tested.";
+        const warning = data.storage && data.storage.warning ? ` ${data.storage.warning}` : "";
+        apiDetail.textContent = `${readState} Write access is tested only when you intentionally post.${warning}`;
+        if (data.defaultFileKey && !fileKeyInput.value) fileKeyInput.value = data.defaultFileKey;
+        tokenInput.disabled = externallyManaged;
+        setBusy(false);
+        if (managed) apiMessage.textContent = "This token is managed by FIGMA_ACCESS_TOKEN in the MCP environment.";
+      }
+      async function loadApiStatus() {
+        if (!bridgeSession) return;
+        const query = `?sessionId=${encodeURIComponent(bridgeSession.sessionId)}&clientId=${encodeURIComponent(bridgeSession.clientId)}`;
+        renderApiStatus(await apiRequest(`/v1/api-credentials/status${query}`));
+      }
+      async function perform(action) {
+        if (!bridgeSession) return;
+        setBusy(true);
+        apiMessage.className = "";
+        apiMessage.textContent = action === "save" ? "Saving and checking access…" : action === "test" ? "Checking access…" : "Removing token…";
+        const body = { sessionId: bridgeSession.sessionId, clientId: bridgeSession.clientId, fileKey: fileKeyInput.value.trim() };
+        if (action === "save") body.accessToken = tokenInput.value;
+        try {
+          const data = await apiRequest(`/v1/api-credentials/${action}`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          tokenInput.value = "";
+          renderApiStatus(data);
+          apiMessage.textContent = action === "clear" ? "API access removed." : data.capabilities && data.capabilities.message ? data.capabilities.message : "API access updated.";
+        } catch (error) {
+          tokenInput.value = "";
+          apiMessage.className = "error";
+          apiMessage.textContent = error.message || String(error);
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      saveButton.onclick = () => perform("save");
+      testButton.onclick = () => perform("test");
+      removeButton.onclick = () => perform("clear");
+      apiDetails.ontoggle = () => parent.postMessage({ pluginMessage: { type: "resize", height: apiDetails.open ? 540 : 250 } }, "*");
+      setBusy(false);
+
       window.onmessage = async (event) => {
         const message = event.data.pluginMessage;
+        if (message?.type === "bridge-session") {
+          bridgeSession = { sessionId: message.sessionId, clientId: message.clientId, bridgeUrl: message.bridgeUrl };
+          setBusy(false);
+          loadApiStatus().catch((error) => { apiMessage.className = "error"; apiMessage.textContent = error.message || String(error); });
+        }
         if (message?.type === "bridge-status") {
-          if (message.kind === "connected") {
-            connectedMessage = message.message;
-            showConnected();
-          } else {
-            showStatus(message.message, message.kind);
-          }
+          if (message.kind === "connected") { connectedMessage = message.message; showConnected(); }
+          else showStatus(message.message, message.kind);
         }
         if (message?.type === "bridge-activity") {
           if (message.phase === "start") {
             showStatus(message.mutating ? "MCP is making changes…" : "MCP is reading…", message.mutating ? "editing" : "reading", message.label);
           } else {
             const success = message.ok === true;
-            showStatus(
-              success ? (message.mutating ? "Change complete" : "Read complete") : (message.mutating ? "Change failed" : "Read failed"),
-              success ? "complete" : "failed",
-              success ? message.label : `${message.label}: ${message.error || "Unknown error"}`,
-            );
+            showStatus(success ? (message.mutating ? "Change complete" : "Read complete") : (message.mutating ? "Change failed" : "Read failed"), success ? "complete" : "failed", success ? message.label : `${message.label}: ${message.error || "Unknown error"}`);
             resetTimer = setTimeout(showConnected, success ? 900 : 2200);
           }
         }

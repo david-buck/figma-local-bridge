@@ -1,8 +1,8 @@
-figma.showUI(__html__, { width: 360, height: 250, title: "Local MCP Bridge" });
+figma.showUI(__html__, { width: 380, height: 250, title: "Local MCP Bridge" });
 
 let bridgeGeneration = 0;
 const bridgeUrl = "http://localhost:3846";
-const pluginVersion = "0.11.1";
+const pluginVersion = "0.12.0";
 const bridgeClientId = `figma-client-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const mutatingCommands = new Set([
   "moveResizeReparent", "updateText", "setTextCase", "deleteNode", "duplicateNode",
@@ -123,6 +123,7 @@ async function startBridge() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ sessionId, clientId: bridgeClientId, info: bridgeContext() }),
       });
+      figma.ui.postMessage({ type: "bridge-session", sessionId, clientId: bridgeClientId, bridgeUrl });
       bridgeStatus(`Connected to local MCP bridge on “${figma.currentPage.name}”. Keep this plugin open.`, "connected");
       while (generation === bridgeGeneration) {
         const message = await bridgeRequest(`/v1/poll${pollQuery(sessionId)}`);
@@ -1635,4 +1636,5 @@ async function execute(name, input) {
 
 figma.ui.onmessage = async (message) => {
   if (message.type === "start") startBridge();
+  if (message.type === "resize" && [250, 540].includes(message.height)) figma.ui.resize(380, message.height);
 };
