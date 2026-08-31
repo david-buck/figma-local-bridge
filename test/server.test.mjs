@@ -159,7 +159,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     capabilities: {},
     clientInfo: { name: "figma-bridge-test", version: "1.0.0" },
   });
-  assert.equal(initialized.serverInfo.version, "0.11.0");
+  assert.equal(initialized.serverInfo.version, "0.11.1");
   assert.match(initialized.instructions, /figma_prepare_review/);
   assert.match(initialized.instructions, /figma_apply_copy_updates/);
   rpc.notify("notifications/initialized");
@@ -172,6 +172,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     "figma_get_user_preferences", "figma_set_user_preference", "figma_delete_user_preference", "figma_revert_user_preferences", "figma_resolve_design_choice",
     "figma_list_design_system_assets", "figma_create_component_instance", "figma_apply_design_style",
     "figma_comment_status", "figma_list_comments", "figma_post_comment", "figma_delete_comment",
+    "figma_set_text_case",
   ]) {
     assert.ok(toolNames.has(name), `${name} should be advertised`);
   }
@@ -293,7 +294,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     capabilities: {},
     clientInfo: { name: "figma-bridge-proxy-test", version: "1.0.0" },
   });
-  assert.equal(proxyInitialized.serverInfo.version, "0.11.0");
+  assert.equal(proxyInitialized.serverInfo.version, "0.11.1");
   proxyRpc.notify("notifications/initialized");
   const proxyStatus = toolJson(await proxyRpc.request("tools/call", { name: "figma_bridge_status", arguments: {} }));
   assert.equal(proxyStatus.connected, true);
@@ -313,6 +314,18 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
       return command;
     }
   }
+
+  const textCaseWorker = serveOne("setTextCase", (command) => {
+    assert.deepEqual(command.input, { nodeId: "2:1", textCase: "upper", expectedText: "Quarterly outlook" });
+    return { mutatedNodeIds: ["2:1"], before: { text: "Quarterly outlook", textCase: "ORIGINAL" }, after: { text: "Quarterly outlook", textCase: "UPPER" } };
+  });
+  const casedText = toolJson(await rpc.request("tools/call", {
+    name: "figma_set_text_case",
+    arguments: { nodeId: "2:1", textCase: "upper", expectedText: "Quarterly outlook" },
+  }));
+  await textCaseWorker;
+  assert.equal(casedText.after.text, "Quarterly outlook");
+  assert.equal(casedText.after.textCase, "UPPER");
 
   const commandNames = [];
   const fakePlugin = (async () => {

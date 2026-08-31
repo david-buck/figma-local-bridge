@@ -24,7 +24,7 @@ async function loadPluginHelpers() {
     setInterval,
     setTimeout,
   });
-  vm.runInContext(`${source}\nglobalThis.__pluginTests = { pollQuery, activityForCommand, replaceTextPreservingStyles, visibilityInfo, auditTextOverflow, auditSummary, archiveNodes, createStyledText, composeFrame, setTextFrame, splitTextBlock, createComponentInstance, applyDesignStyle, figma };`, context);
+  vm.runInContext(`${source}\nglobalThis.__pluginTests = { pollQuery, activityForCommand, replaceTextPreservingStyles, visibilityInfo, auditTextOverflow, auditSummary, archiveNodes, createStyledText, composeFrame, setTextFrame, setTextCase, splitTextBlock, createComponentInstance, applyDesignStyle, figma };`, context);
   return context.__pluginTests;
 }
 
@@ -65,10 +65,11 @@ function styledText(id, characters, parent) {
     textAutoResize: "NONE",
     textTruncation: "DISABLED",
     maxLines: null,
+    textCase: "ORIGINAL",
     fontName: { family: "Inter", style: "Regular" },
     absoluteBoundingBox: { x: 10, y: 20, width: 180, height: 60 },
     getStyledTextSegments() {
-      return this.characters ? [{ start: 0, end: this.characters.length, characters: this.characters, fontName: this.fontName, fontSize: 16, fills: [] }] : [];
+      return this.characters ? [{ start: 0, end: this.characters.length, characters: this.characters, fontName: this.fontName, fontSize: 16, textCase: this.textCase, fills: [] }] : [];
     },
     insertCharacters(start, value) {
       this.characters = this.characters.slice(0, start) + value + this.characters.slice(start);
@@ -348,6 +349,17 @@ test("text-frame utility changes sizing without replacing copy", async () => {
   assert.equal(result.after.width, 240);
   assert.equal(result.after.textAutoResize, "HEIGHT");
   assert.equal(result.after.textTruncation, "DISABLED");
+});
+
+test("typographic case changes presentation without rewriting stored copy", async () => {
+  const { setTextCase, figma } = await loadPluginHelpers();
+  const node = styledText("2:2", "Quarterly outlook", null);
+  configurePage(figma, [node]);
+  const result = await setTextCase({ nodeId: node.id, textCase: "upper", expectedText: "Quarterly outlook" });
+  assert.equal(node.characters, "Quarterly outlook");
+  assert.equal(node.textCase, "UPPER");
+  assert.equal(result.before.textCase, "ORIGINAL");
+  assert.equal(result.after.textCase, "UPPER");
 });
 
 test("split utility preserves copy in separate heading and body layers", async () => {

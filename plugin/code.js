@@ -2,10 +2,10 @@ figma.showUI(__html__, { width: 360, height: 250, title: "Local MCP Bridge" });
 
 let bridgeGeneration = 0;
 const bridgeUrl = "http://localhost:3846";
-const pluginVersion = "0.11.0";
+const pluginVersion = "0.11.1";
 const bridgeClientId = `figma-client-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const mutatingCommands = new Set([
-  "moveResizeReparent", "updateText", "deleteNode", "duplicateNode",
+  "moveResizeReparent", "updateText", "setTextCase", "deleteNode", "duplicateNode",
   "createFrame", "createText", "createRectangle", "createEllipse",
   "importSvg", "styleNode", "createColorTokens", "setAutoLayout",
   "applyCopyUpdates", "setTextFrame", "splitTextBlock",
@@ -373,6 +373,23 @@ async function setTextFrame(input) {
       maxLines: node.maxLines,
     },
     text: compactTextNode(figma.currentPage, node, 0),
+  };
+}
+
+async function setTextCase(input) {
+  const node = textNodeById(input.nodeId);
+  if (input.expectedText !== undefined && node.characters !== input.expectedText) {
+    throw new Error(`Text ${node.id} changed since it was read. Re-read it before changing typographic case.`);
+  }
+  await loadCurrentTextFonts(node);
+  const before = { text: node.characters, textCase: mixedValue(node.textCase) };
+  node.textCase = figmaTextCase(input.textCase);
+  focus(node);
+  return {
+    mutatedNodeIds: [node.id],
+    before,
+    after: { text: node.characters, textCase: mixedValue(node.textCase) },
+    node: serializeNode(node),
   };
 }
 
@@ -1445,6 +1462,8 @@ async function execute(name, input) {
   }
 
   if (name === "setTextFrame") return setTextFrame(input);
+
+  if (name === "setTextCase") return setTextCase(input);
 
   if (name === "splitTextBlock") return splitTextBlock(input);
 

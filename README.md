@@ -186,6 +186,7 @@ The bridge keeps its command surface intentionally narrow. It exposes the follow
 - `figma_screenshot` — return a PNG for a selected node or the visible page.
 - `figma_move_resize_reparent`, `figma_set_selection`, `figma_duplicate_node` — controlled structural editing.
 - `figma_read_text` / `figma_update_text` — inspect and replace existing editable text with its current fonts loaded first.
+- `figma_set_text_case` — display existing natural-case copy as uppercase, lowercase, title case, small caps, or original without rewriting its characters.
 - `figma_read_copy` — compact, ordered text IDs/copy/bounds/visibility for external-source diffing.
 - `figma_apply_copy_updates` — guarded style-preserving updates plus overflow audits and local PNG verification in one response.
 - `figma_set_text_frame` — set text width, height, auto-resize, truncation, and line limits without replacing copy.

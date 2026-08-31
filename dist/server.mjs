@@ -31013,7 +31013,7 @@ var launchParentPid = process.ppid;
 var sessionFreshnessMs = 35e3;
 var replacedSessionRetentionMs = 5 * 6e4;
 var proxyHealthIntervalMs = 2e3;
-var bridgeVersion = "0.11.0";
+var bridgeVersion = "0.11.1";
 var exportDirectory = process.env.FIGMA_EXPORT_DIR ?? join(homedir(), "Pictures", "Figma MCP Exports");
 var preferencesDirectory = process.env.FIGMA_PREFERENCES_DIR ?? join(homedir(), ".figma-local-bridge");
 var preferencesPath = join(preferencesDirectory, "preferences.json");
@@ -31931,7 +31931,8 @@ var workflowInstructions = [
   "Prefer confirmed user choices, linked-system component instances, bound variables and named Figma styles\u2014in that order\u2014over detached copies, manually reconstructed components or raw visual values.",
   "When multiple systems or assets are equally plausible, call figma_resolve_design_choice. If it returns needsClarification=true, do not edit: ask the user to choose, then offer to save the answer with figma_set_user_preference.",
   "Only create, update, delete or revert a stored preference after an explicit user instruction or confirmation. Never silently learn a preference from one document.",
-  "Treat casing as typography: use textCase on the text layer or styled span rather than replacing natural-case characters with capitals, unless the source copy or user explicitly requires a character-level case change.",
+  "Before creating or replacing text, separate content from presentation. Author generated headings, labels and buttons in natural case; display uppercase, lowercase, title case or small caps with textCase or figma_set_text_case.",
+  "Never pass all-caps characters merely to make text look uppercase. Preserve exact all-caps characters only when they are semantically intended, supplied as authoritative copy, or explicitly requested by the user.",
   "For a page re-layout: inspect and export the current artboard, list page tokens or copy style from verified source nodes, compose the named replacement with figma_compose_frame, archive explicit previous sibling nodes only after the replacement succeeds, then inspect the returned audit and PNG.",
   "Prefer figma_archive_nodes or figma_supersede_layout over deletion or opacity-zero superseded layers. Use approved local image paths only when the user placed that file in scope.",
   "Do not begin from arbitrary page traversal or the current selection when artboard discovery is available. Delete only a clearly stray, user-identified element; otherwise preserve it."
@@ -32342,11 +32343,26 @@ server.registerTool("figma_read_text", {
 });
 server.registerTool("figma_update_text", {
   title: "Update Figma text",
-  description: "Replace text using a minimal character-range edit so unaffected mixed styles survive. Supply expectedText from the latest compact read to prevent overwriting a newer Figma edit.",
+  description: "Replace stored copy using a minimal character-range edit so unaffected mixed styles survive. Write generated copy in natural case and use figma_set_text_case for visual casing; never send capital letters merely as an uppercase treatment. Supply expectedText from the latest compact read to prevent overwriting a newer Figma edit.",
   inputSchema: { nodeId, text: external_exports.string().max(1e5), expectedText: external_exports.string().max(1e5).optional() }
 }, async (input) => {
   try {
     return output(await sendCommand("updateText", input));
+  } catch (error51) {
+    return failure(error51);
+  }
+});
+server.registerTool("figma_set_text_case", {
+  title: "Set Figma typographic case",
+  description: "Change how an existing text layer displays case without changing its stored characters. Use this for visual uppercase, lowercase, title case, or small caps instead of rewriting natural-case copy as capitals.",
+  inputSchema: {
+    nodeId,
+    textCase: textCase.describe("The typographic case modifier to apply to the whole text layer."),
+    expectedText: external_exports.string().max(1e5).optional().describe("Exact stored characters from the latest read. The change stops if the copy has changed.")
+  }
+}, async (input) => {
+  try {
+    return output(await sendCommand("setTextCase", input));
   } catch (error51) {
     return failure(error51);
   }
