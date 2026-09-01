@@ -159,7 +159,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     capabilities: {},
     clientInfo: { name: "figma-bridge-test", version: "1.0.0" },
   });
-  assert.equal(initialized.serverInfo.version, "0.12.1");
+  assert.equal(initialized.serverInfo.version, "0.12.2");
   assert.match(initialized.instructions, /figma_prepare_review/);
   assert.match(initialized.instructions, /figma_apply_copy_updates/);
   rpc.notify("notifications/initialized");
@@ -294,7 +294,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     capabilities: {},
     clientInfo: { name: "figma-bridge-proxy-test", version: "1.0.0" },
   });
-  assert.equal(proxyInitialized.serverInfo.version, "0.12.1");
+  assert.equal(proxyInitialized.serverInfo.version, "0.12.2");
   proxyRpc.notify("notifications/initialized");
   const proxyStatus = toolJson(await proxyRpc.request("tools/call", { name: "figma_bridge_status", arguments: {} }));
   assert.equal(proxyStatus.connected, true);
@@ -338,6 +338,20 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
   }));
   await svgWorker;
   assert.equal(importedSvg.node.id, "9:1");
+
+  const scriptedSvg = await rpc.request("tools/call", {
+    name: "figma_import_svg",
+    arguments: { name: "Unsafe script", svg: "<svg><script>alert(1)</script></svg>", x: 0, y: 0 },
+  });
+  assert.equal(scriptedSvg.isError, true);
+  assert.match(scriptedSvg.content[0].text, /scripts, iframes, or foreignObject/);
+
+  const eventHandlerSvg = await rpc.request("tools/call", {
+    name: "figma_import_svg",
+    arguments: { name: "Unsafe event", svg: '<svg><rect onclick="alert(1)" /></svg>', x: 0, y: 0 },
+  });
+  assert.equal(eventHandlerSvg.isError, true);
+  assert.match(eventHandlerSvg.content[0].text, /event handlers/);
 
   const commandNames = [];
   const fakePlugin = (async () => {

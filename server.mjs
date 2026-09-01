@@ -14,7 +14,7 @@ const launchParentPid = process.ppid;
 const sessionFreshnessMs = 35_000;
 const replacedSessionRetentionMs = 5 * 60_000;
 const proxyHealthIntervalMs = 2_000;
-const bridgeVersion = "0.12.1";
+const bridgeVersion = "0.12.2";
 const exportDirectory = process.env.FIGMA_EXPORT_DIR ?? join(homedir(), "Pictures", "Figma MCP Exports");
 const preferencesDirectory = process.env.FIGMA_PREFERENCES_DIR ?? join(homedir(), ".figma-local-bridge");
 const preferencesPath = join(preferencesDirectory, "preferences.json");
@@ -1777,8 +1777,8 @@ server.registerTool("figma_import_svg", {
     name: z.string().trim().min(1).max(200),
     svg: z.string().trim().min(20).max(200_000)
       .refine((value) => /^<svg[\s>]/i.test(value), "SVG content must begin with an <svg> element.")
-      .refine((value) => !/<\\s*(script|iframe|foreignObject)\\b/i.test(value), "SVG may not contain scripts, iframes, or foreignObject elements.")
-      .refine((value) => !/\\son\\w+\\s*=/i.test(value), "SVG may not contain event handlers."),
+      .refine((value) => !/<\s*(script|iframe|foreignObject)\b/i.test(value), "SVG may not contain scripts, iframes, or foreignObject elements.")
+      .refine((value) => !/\son\w+\s*=/i.test(value), "SVG may not contain event handlers."),
     ...position,
     parentId: nodeId.optional().describe("Optional frame, group, component, or section on the current page. Omit to create on the page."),
     width: z.number().finite().min(1).max(10_000).optional(),
