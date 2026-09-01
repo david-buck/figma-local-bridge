@@ -159,7 +159,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     capabilities: {},
     clientInfo: { name: "figma-bridge-test", version: "1.0.0" },
   });
-  assert.equal(initialized.serverInfo.version, "0.12.0");
+  assert.equal(initialized.serverInfo.version, "0.12.1");
   assert.match(initialized.instructions, /figma_prepare_review/);
   assert.match(initialized.instructions, /figma_apply_copy_updates/);
   rpc.notify("notifications/initialized");
@@ -294,7 +294,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     capabilities: {},
     clientInfo: { name: "figma-bridge-proxy-test", version: "1.0.0" },
   });
-  assert.equal(proxyInitialized.serverInfo.version, "0.12.0");
+  assert.equal(proxyInitialized.serverInfo.version, "0.12.1");
   proxyRpc.notify("notifications/initialized");
   const proxyStatus = toolJson(await proxyRpc.request("tools/call", { name: "figma_bridge_status", arguments: {} }));
   assert.equal(proxyStatus.connected, true);
@@ -326,6 +326,18 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
   await textCaseWorker;
   assert.equal(casedText.after.text, "Quarterly outlook");
   assert.equal(casedText.after.textCase, "UPPER");
+
+  const attributedSvg = '<svg width="10" height="10"><rect width="10" height="10" /></svg>';
+  const svgWorker = serveOne("importSvg", (command) => {
+    assert.equal(command.input.svg, attributedSvg);
+    return { createdNodeIds: ["9:1"], node: { id: "9:1", name: "Attributed SVG", type: "FRAME" } };
+  });
+  const importedSvg = toolJson(await rpc.request("tools/call", {
+    name: "figma_import_svg",
+    arguments: { name: "Attributed SVG", svg: attributedSvg, x: 0, y: 0 },
+  }));
+  await svgWorker;
+  assert.equal(importedSvg.node.id, "9:1");
 
   const commandNames = [];
   const fakePlugin = (async () => {

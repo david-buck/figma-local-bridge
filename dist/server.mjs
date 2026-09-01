@@ -31232,7 +31232,7 @@ var launchParentPid = process.ppid;
 var sessionFreshnessMs = 35e3;
 var replacedSessionRetentionMs = 5 * 6e4;
 var proxyHealthIntervalMs = 2e3;
-var bridgeVersion = "0.12.0";
+var bridgeVersion = "0.12.1";
 var exportDirectory = process.env.FIGMA_EXPORT_DIR ?? join2(homedir(), "Pictures", "Figma MCP Exports");
 var preferencesDirectory = process.env.FIGMA_PREFERENCES_DIR ?? join2(homedir(), ".figma-local-bridge");
 var preferencesPath = join2(preferencesDirectory, "preferences.json");
@@ -33069,7 +33069,7 @@ server.registerTool("figma_import_svg", {
   description: "Place an SVG string as editable vector artwork on the current page. Intended for approved SVG logo assets, icons, and simple decorative paths; it rejects scripts and event handlers.",
   inputSchema: {
     name: external_exports.string().trim().min(1).max(200),
-    svg: external_exports.string().trim().min(20).max(2e5).refine((value) => /^<svg[\\s>]/i.test(value), "SVG content must begin with an <svg> element.").refine((value) => !/<\\s*(script|iframe|foreignObject)\\b/i.test(value), "SVG may not contain scripts, iframes, or foreignObject elements.").refine((value) => !/\\son\\w+\\s*=/i.test(value), "SVG may not contain event handlers."),
+    svg: external_exports.string().trim().min(20).max(2e5).refine((value) => /^<svg[\s>]/i.test(value), "SVG content must begin with an <svg> element.").refine((value) => !/<\\s*(script|iframe|foreignObject)\\b/i.test(value), "SVG may not contain scripts, iframes, or foreignObject elements.").refine((value) => !/\\son\\w+\\s*=/i.test(value), "SVG may not contain event handlers."),
     ...position,
     parentId: nodeId.optional().describe("Optional frame, group, component, or section on the current page. Omit to create on the page."),
     width: external_exports.number().finite().min(1).max(1e4).optional(),
