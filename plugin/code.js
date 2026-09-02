@@ -2,11 +2,11 @@ figma.showUI(__html__, { width: 380, height: 250, title: "Local MCP Bridge" });
 
 let bridgeGeneration = 0;
 const bridgeUrl = "http://localhost:3846";
-const pluginVersion = "0.12.2";
+const pluginVersion = "0.13.0";
 const bridgeClientId = `figma-client-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const mutatingCommands = new Set([
   "moveResizeReparent", "updateText", "setTextCase", "deleteNode", "duplicateNode",
-  "createFrame", "createText", "createRectangle", "createEllipse",
+  "createSection", "createFrame", "createText", "createRectangle", "createEllipse",
   "importSvg", "styleNode", "createColorTokens", "setAutoLayout",
   "applyCopyUpdates", "setTextFrame", "splitTextBlock",
   "archiveNodes", "composeFrame", "copyStyleFromNode", "copyImageFill", "placeLocalImage",
@@ -516,6 +516,107 @@ function orderedByPosition(nodes) {
   });
 }
 
+function layoutBounds(node) {
+  const bounds = node?.absoluteBoundingBox;
+  if (bounds) return { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height };
+  if (!node || typeof node.x !== "number" || typeof node.y !== "number" || typeof node.width !== "number" || typeof node.height !== "number") return null;
+  let x = node.x;
+  let y = node.y;
+  let parent = node.parent;
+  while (parent && parent.type !== "PAGE" && parent.type !== "DOCUMENT") {
+    x += typeof parent.x === "number" ? parent.x : 0;
+    y += typeof parent.y === "number" ? parent.y : 0;
+    parent = parent.parent;
+  }
+  return { x, y, width: node.width, height: node.height };
+}
+
+function layoutVisible(node) {
+  let current = node;
+  while (current && current.type !== "PAGE" && current.type !== "DOCUMENT") {
+    if (current.visible === false || current.opacity === 0) return false;
+    current = current.parent;
+  }
+  return true;
+}
+
+function intersectBounds(left, right) {
+  const x = Math.max(left.x, right.x);
+  const y = Math.max(left.y, right.y);
+  const width = Math.min(left.x + left.width, right.x + right.width) - x;
+  const height = Math.min(left.y + left.height, right.y + right.height) - y;
+  return width > 0 && height > 0 ? { x, y, width, height, area: width * height } : null;
+}
+
+function unionBounds(bounds) {
+  if (!bounds.length) return null;
+  const minX = Math.min(...bounds.map((item) => item.x));
+  const minY = Math.min(...bounds.map((item) => item.y));
+  const maxX = Math.max(...bounds.map((item) => item.x + item.width));
+  const maxY = Math.max(...bounds.map((item) => item.y + item.height));
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
+function proposedAbsoluteBounds(proposed, parent) {
+  const parentBounds = parent.type === "PAGE" ? { x: 0, y: 0 } : layoutBounds(parent);
+  if (!parentBounds) throw new Error("The proposed parent has no readable canvas bounds.");
+  return { x: parentBounds.x + proposed.x, y: parentBounds.y + proposed.y, width: proposed.width, height: proposed.height };
+}
+
+function siblingCollisionReport(targetBounds, parent, excludedIds = [], includeHidden = false, limit = 250) {
+  const excluded = new Set(excludedIds);
+  const candidates = "children" in parent ? parent.children : [];
+  const overlaps = [];
+  for (const candidate of candidates) {
+    if (excluded.has(candidate.id) || (!includeHidden && !layoutVisible(candidate))) continue;
+    const bounds = layoutBounds(candidate);
+    if (!bounds) continue;
+    const intersection = intersectBounds(targetBounds, bounds);
+    if (intersection) overlaps.push({ node: serializeNode(candidate), intersection });
+    if (overlaps.length >= limit) break;
+  }
+  return { clear: overlaps.length === 0, overlapCount: overlaps.length, overlaps };
+}
+
+function canvasLayout(input) {
+  const topLevel = figma.currentPage.children.filter((node) => input.includeHidden || layoutVisible(node));
+  const topLevelBounds = topLevel.map(layoutBounds).filter(Boolean);
+  const sections = topLevel.filter((node) => node.type === "SECTION").map((section) => ({
+    id: section.id,
+    name: section.name,
+    bounds: layoutBounds(section),
+    childCount: section.children.length,
+    artboards: section.children.filter((child) => ["FRAME", "COMPONENT", "INSTANCE"].includes(child.type)).map((child) => ({ id: child.id, name: child.name, type: child.type, bounds: layoutBounds(child) })),
+  }));
+  let target = null;
+  let parent = figma.currentPage;
+  let bounds = null;
+  const excludedIds = [...(input.ignoreNodeIds ?? [])];
+  if (input.nodeId) {
+    const node = sceneNode(input.nodeId);
+    parent = node.parent;
+    if (!parent || !("children" in parent)) throw new Error("The target node has no inspectable sibling container.");
+    bounds = layoutBounds(node);
+    if (!bounds) throw new Error("The target node has no readable canvas bounds.");
+    target = { kind: "node", node: serializeNode(node), bounds };
+    excludedIds.push(node.id);
+  } else if (input.proposed) {
+    parent = pageNode(input.proposed.parentId);
+    if (!("children" in parent)) throw new Error("The proposed parent cannot contain children.");
+    bounds = proposedAbsoluteBounds(input.proposed, parent);
+    target = { kind: "proposed", bounds, relativeBounds: { x: input.proposed.x, y: input.proposed.y, width: input.proposed.width, height: input.proposed.height }, parentId: parent.id };
+  }
+  const collision = bounds ? siblingCollisionReport(bounds, parent, excludedIds, input.includeHidden, input.limit) : null;
+  return {
+    page: { id: figma.currentPage.id, name: figma.currentPage.name, unbounded: true },
+    contentBounds: unionBounds(topLevelBounds),
+    sections,
+    topLevelNodes: topLevel.slice(0, input.limit).map((node) => serializeNode(node)),
+    ...(target ? { target, parent: { id: parent.id, name: parent.name, type: parent.type }, collision } : {}),
+    note: "Figma pages are unbounded; contentBounds is the occupied top-level canvas envelope, not a page boundary.",
+  };
+}
+
 function orderedChildren(container) {
   if (!("children" in container)) return [];
   if (container.layoutMode === "HORIZONTAL") {
@@ -985,9 +1086,17 @@ async function composeFrame(input) {
   try {
     root.name = input.frame.name;
     root.resize(input.frame.width, input.frame.height);
+    appendToParent(root, input.frame.parentId);
     root.x = input.frame.x;
     root.y = input.frame.y;
     await applyVisualStyle(root, input.frame);
+    applyAutoLayout(root, { direction: input.frame.layout ?? "none", itemSpacing: input.frame.itemSpacing ?? 0, padding: input.frame.padding ?? 0 });
+    const rootBounds = layoutBounds(root);
+    if (!rootBounds || !root.parent || !("children" in root.parent)) throw new Error("The composed frame has no inspectable canvas placement.");
+    const placement = siblingCollisionReport(rootBounds, root.parent, [root.id, ...input.archiveNodeIds], false, 250);
+    if ((input.collisionPolicy ?? "reject") === "reject" && !placement.clear) {
+      throw new Error(`The composed frame would overlap ${placement.overlapCount} existing sibling node${placement.overlapCount === 1 ? "" : "s"}. Inspect canvas layout or choose collisionPolicy=report only when the overlap is intentional.`);
+    }
 
     for (const element of input.elements) {
       const parent = element.parentKey ? byKey.get(element.parentKey) : root;
@@ -1017,15 +1126,21 @@ async function composeFrame(input) {
       byKey.set(element.key, node);
     }
 
+    if (created.length !== input.elements.length + 1 || byKey.size !== input.elements.length) {
+      throw new Error(`Composition created ${created.length - 1} of ${input.elements.length} requested native elements.`);
+    }
+
     let archived = null;
     if (preparedArchive) archived = archiveNodes({ nodeIds: input.archiveNodeIds, replacementNodeId: root.id, archiveName: input.archiveName, reason: input.archiveReason }, { ...preparedArchive, replacement: root });
     const audits = input.audit ? [{ frameId: root.id, result: auditSummary(await auditTextOverflow(root, { includeHidden: false })) }] : [];
     const exports = input.export ? [{ frameId: root.id, result: { ...(await screenshotNode(root, input)), nodeName: root.name } }] : [];
     focus(root);
     return {
+      ok: true,
       createdNodeIds: created.map((node) => node.id),
       frame: serializeNode(root),
       elements: [...byKey].map(([key, node]) => ({ key, id: node.id, name: node.name, type: node.type })),
+      placement,
       ...(archived ? { archived: archived.archive } : {}),
       audits,
       exports,
@@ -1345,6 +1460,8 @@ async function execute(name, input) {
     };
   }
 
+  if (name === "inspectCanvasLayout") return canvasLayout(input);
+
   if (name === "listArtboards") {
     const artboards = [];
     for (const child of figma.currentPage.children) {
@@ -1502,6 +1619,28 @@ async function execute(name, input) {
     duplicate.y += input.offsetY;
     focus(duplicate);
     return { sourceNodeId: node.id, createdNodeIds: [duplicate.id], node: serializeNode(duplicate) };
+  }
+
+  if (name === "createSection") {
+    const node = figma.createSection();
+    try {
+      node.name = input.name;
+      node.resize(input.width, input.height);
+      node.x = input.x;
+      node.y = input.y;
+      if (input.fillColor !== undefined) node.fills = [solidPaint(input.fillColor, input.fillOpacity ?? 1)];
+      if (input.opacity !== undefined) node.opacity = input.opacity;
+      const bounds = layoutBounds(node);
+      if (!bounds) throw new Error("The new section has no readable canvas bounds.");
+      const placement = siblingCollisionReport(bounds, figma.currentPage, [node.id], false, 250);
+      if ((input.collisionPolicy ?? "reject") === "reject" && !placement.clear) {
+        throw new Error(`The new section would overlap ${placement.overlapCount} existing top-level node${placement.overlapCount === 1 ? "" : "s"}. Inspect canvas layout or choose collisionPolicy=report only when the overlap is intentional.`);
+      }
+      focus(node);
+      return { createdNodeIds: [node.id], section: serializeNode(node), placement };
+    } catch (error) {
+      return removeFailedCreation(node, error);
+    }
   }
 
   if (name === "createFrame") {

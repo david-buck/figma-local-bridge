@@ -45,6 +45,8 @@ Comments use Figma's REST API rather than the live plugin connection. Canvas too
 
 Use the bridge for deterministic mechanics: frame geometry, hierarchy, components, named styles, text bounds, overflow, alignment and mutations. Use this skill for editorial hierarchy, page purpose, content density, print-reading judgement and deciding when an image review is worth its cost.
 
+Reference boards and new canvas areas must use native Figma structure: create a `SECTION` with `figma_create_section`, then place native frames, components and editable text inside it. Never use an imported SVG group as a board, panel system, UI layout, or editable label. Reserve `figma_import_svg` for approved logos, icons and isolated vector artwork.
+
 Do not ask image output to prove routine text updates. Treat text bounds, re-read copy and overflow results as sufficient unless a change may alter adjacent elements, column balance, image relationship or hierarchy. Prefer one targeted screenshot over a PNG export when a visual check is necessary.
 
 ## Design-system preferences and tie-breaks
@@ -99,6 +101,14 @@ Use this deterministic flow when replacing an existing brochure page or artboard
 5. Inspect the compact audit and local PNG returned by the composer. If verification is incomplete, preserve the previous layout and diagnose before retrying. Use a full read only when the summary lacks necessary hierarchy.
 6. Re-read the replacement in summary mode and confirm the archive name/replacement relationship. Do not delete the archived group unless the user later identifies it for permanent removal.
 
+## Reference-board recipe
+
+1. Call `figma_inspect_canvas_layout` without a target to read native sections and the occupied top-level canvas envelope. Figma pages are unbounded; do not mistake that envelope for a page boundary.
+2. Collision-check the proposed section rectangle. Create it with `figma_create_section` only when the result is clear, or when the user explicitly accepts an intentional overlap.
+3. Use `figma_compose_frame` with the new section ID as `frame.parentId`. Build panels from native frames/components and labels from editable natural-case Figma text with `textCase` styling.
+4. Treat a blank response, `COMPOSITION_EMPTY_OR_INCOMPLETE`, or any other composition failure as a hard stop. Inspect and retry the native path; never switch to an SVG layout workaround.
+5. Call `figma_inspect_canvas_layout` with the created node ID to verify sibling collisions. Use a targeted screenshot when adjacency or visual overlap still requires judgement.
+
 ## Working rules
 
 - Treat artboard IDs and text-node IDs returned by read tools as the source of truth.
@@ -106,6 +116,7 @@ Use this deterministic flow when replacing an existing brochure page or artboard
 - Keep spread order explicit. Do not infer left/right order from node names.
 - Treat `copy` as effectively visible text. Check `allCopy`, `hiddenTextCount`, and each text item's `effectiveVisible` value when hidden variants or conditional content matter.
 - Before every text creation or replacement, distinguish stored content from visual casing. Author generated headings, labels, buttons and navigation copy in natural sentence/title case, then apply `textCase` during creation or call `figma_set_text_case` for an existing layer. Never send all-caps characters merely to make text look uppercase.
+- Never put UI-label copy into SVG paths or SVG text. Keep it as native, editable Figma text in natural case and use `textCase` for presentation.
 - Preserve exact all-caps characters only when they are semantically meaningful, supplied by an authoritative source, or explicitly requested as character-level copy. If an existing source is ambiguous, preserve it rather than guessing the natural capitalization.
 - Treat emphasis, case, decoration, line height, letter spacing, font family/style, and size as typography—not copy. Prefer verified Figma text styles, `figma_copy_style_from_node`, or styled-span options over manually altering characters or splitting text into extra layers.
 - Preserve design-system linkage. Prefer `figma_create_component_instance`, `figma_apply_design_style`, and bound variables over detached copies or hand-built imitations.
@@ -114,6 +125,7 @@ Use this deterministic flow when replacing an existing brochure page or artboard
 - For copy-only work, overwrite the existing visible text layers. Do not create duplicate layouts, hide existing layers, or reduce old nodes to zero opacity. Use replacement/archival only for an explicitly requested layout change, and state the result clearly.
 - Prefer `figma_archive_nodes` or `figma_supersede_layout` over opacity-zero superseded layers. Archive only explicit siblings and always record the replacement when one exists.
 - Use `figma_compose_frame` for bounded page composition that would otherwise require many serial creation calls. Treat its audit and exported PNG as required verification, not optional decoration.
+- Before placing a new section or top-level frame, inspect canvas bounds and collision-check the proposed rectangle. After placement, collision-check the actual node and visually inspect any uncertain adjacency; coordinate assumptions alone are not verification.
 - Use `figma_place_local_image` only for an absolute local image path the user explicitly placed in scope. Prefer `figma_copy_image_fill` when an approved image already exists in Figma.
 - Delete only a clearly stray element that the user identified. Otherwise preserve it, including superseded or hidden elements.
 - Use `figma_screenshot` for a targeted, one-off visual check. Use `figma_export_frame_png` only for a full-page/layout review, imagery, comparison or an artefact that needs to be retained; do not export routine copy-only changes.

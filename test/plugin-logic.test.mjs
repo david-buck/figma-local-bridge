@@ -24,7 +24,7 @@ async function loadPluginHelpers() {
     setInterval,
     setTimeout,
   });
-  vm.runInContext(`${source}\nglobalThis.__pluginTests = { pollQuery, activityForCommand, replaceTextPreservingStyles, visibilityInfo, auditTextOverflow, auditSummary, archiveNodes, createStyledText, composeFrame, setTextFrame, setTextCase, splitTextBlock, createComponentInstance, applyDesignStyle, figma };`, context);
+  vm.runInContext(`${source}\nglobalThis.__pluginTests = { pollQuery, activityForCommand, replaceTextPreservingStyles, visibilityInfo, auditTextOverflow, auditSummary, archiveNodes, createStyledText, composeFrame, canvasLayout, setTextFrame, setTextCase, splitTextBlock, createComponentInstance, applyDesignStyle, execute, figma };`, context);
   return context.__pluginTests;
 }
 
@@ -338,6 +338,87 @@ test("compose frame removes the entire new subtree when a later element fails", 
     archiveNodeIds: [], audit: false, export: false,
   }), /exceeds text length/);
   assert.equal(page.children.length, 0);
+});
+
+test("compose frame can build native panels inside a section with root auto-layout", async () => {
+  const { composeFrame, figma } = await loadPluginHelpers();
+  const section = {
+    id: "7:1", name: "Reference board", type: "SECTION", x: 100, y: 100, width: 800, height: 600, visible: true, opacity: 1, children: [],
+    appendChild(child) {
+      const previousIndex = child.parent?.children?.indexOf(child) ?? -1;
+      if (previousIndex >= 0) child.parent.children.splice(previousIndex, 1);
+      child.parent = this;
+      this.children.push(child);
+    },
+  };
+  const page = configurePage(figma, [section]);
+  let nextId = 2;
+  figma.createFrame = () => {
+    const node = {
+      id: `7:${nextId++}`, name: "", type: "FRAME", x: 0, y: 0, width: 100, height: 100, visible: true, opacity: 1, fills: [], strokes: [], children: [], removed: false, layoutMode: "NONE",
+      resize(width, height) { this.width = width; this.height = height; },
+      appendChild(child) {
+        const previousIndex = child.parent?.children?.indexOf(child) ?? -1;
+        if (previousIndex >= 0) child.parent.children.splice(previousIndex, 1);
+        child.parent = this;
+        this.children.push(child);
+      },
+      remove() { this.removed = true; const index = this.parent?.children?.indexOf(this) ?? -1; if (index >= 0) this.parent.children.splice(index, 1); },
+    };
+    page.appendChild(node);
+    return node;
+  };
+  const result = await composeFrame({
+    frame: { name: "Native board", parentId: section.id, width: 500, height: 400, x: 20, y: 30, layout: "vertical", itemSpacing: 16, padding: 24 },
+    elements: [{ type: "frame", key: "panel", name: "Panel", width: 452, height: 100, x: 0, y: 0, layout: "none", itemSpacing: 0, padding: 0 }],
+    archiveNodeIds: [], collisionPolicy: "reject", audit: false, export: false,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.frame.parent.id, section.id);
+  assert.equal(section.children[0].layoutMode, "VERTICAL");
+  assert.equal(section.children[0].itemSpacing, 16);
+  assert.equal(section.children[0].paddingTop, 24);
+  assert.equal(result.elements[0].type, "FRAME");
+  assert.equal(result.placement.clear, true);
+});
+
+test("canvas layout reports sections, occupied bounds, and proposed sibling collisions", async () => {
+  const { canvasLayout, figma } = await loadPluginHelpers();
+  const sectionChild = { id: "3:1", name: "Reference panel", type: "FRAME", x: 20, y: 30, width: 200, height: 120, visible: true, opacity: 1, children: [] };
+  const section = { id: "2:1", name: "References", type: "SECTION", x: 0, y: 0, width: 400, height: 300, visible: true, opacity: 1, children: [sectionChild] };
+  const frame = { id: "2:2", name: "Existing board", type: "FRAME", x: 500, y: 0, width: 100, height: 100, visible: true, opacity: 1, children: [] };
+  const page = configurePage(figma, [section, frame]);
+  sectionChild.parent = section;
+  const result = canvasLayout({ proposed: { x: 350, y: 0, width: 200, height: 100 }, ignoreNodeIds: [], includeHidden: false, limit: 250 });
+  assert.equal(result.contentBounds.x, 0);
+  assert.equal(result.contentBounds.y, 0);
+  assert.equal(result.contentBounds.width, 600);
+  assert.equal(result.contentBounds.height, 300);
+  assert.equal(result.sections[0].id, section.id);
+  assert.equal(result.sections[0].artboards[0].id, sectionChild.id);
+  assert.equal(result.parent.id, page.id);
+  assert.equal(result.collision.clear, false);
+  assert.equal(result.collision.overlapCount, 2);
+});
+
+test("native section creation rejects accidental overlap", async () => {
+  const { execute, figma } = await loadPluginHelpers();
+  const occupied = { id: "2:1", name: "Occupied", type: "FRAME", x: 0, y: 0, width: 200, height: 200, visible: true, opacity: 1, children: [] };
+  const page = configurePage(figma, [occupied]);
+  let nextId = 2;
+  figma.createSection = () => {
+    const section = {
+      id: `2:${nextId++}`, name: "", type: "SECTION", x: 0, y: 0, width: 100, height: 100, visible: true, opacity: 1, fills: [], children: [], removed: false,
+      resize(width, height) { this.width = width; this.height = height; },
+      remove() { this.removed = true; const index = page.children.indexOf(this); if (index >= 0) page.children.splice(index, 1); },
+    };
+    page.appendChild(section);
+    return section;
+  };
+  const created = await execute("createSection", { name: "References", x: 300, y: 0, width: 400, height: 300, collisionPolicy: "reject" });
+  assert.equal(created.section.type, "SECTION");
+  await assert.rejects(() => execute("createSection", { name: "Overlapping", x: 100, y: 50, width: 300, height: 200, collisionPolicy: "reject" }), /would overlap/);
+  assert.equal(page.children.filter((node) => node.type === "SECTION").length, 1);
 });
 
 test("text-frame utility changes sizing without replacing copy", async () => {

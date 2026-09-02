@@ -31232,7 +31232,7 @@ var launchParentPid = process.ppid;
 var sessionFreshnessMs = 35e3;
 var replacedSessionRetentionMs = 5 * 6e4;
 var proxyHealthIntervalMs = 2e3;
-var bridgeVersion = "0.12.2";
+var bridgeVersion = "0.13.0";
 var exportDirectory = process.env.FIGMA_EXPORT_DIR ?? join2(homedir(), "Pictures", "Figma MCP Exports");
 var preferencesDirectory = process.env.FIGMA_PREFERENCES_DIR ?? join2(homedir(), ".figma-local-bridge");
 var preferencesPath = join2(preferencesDirectory, "preferences.json");
@@ -31734,10 +31734,27 @@ async function localizeBatchExports(data) {
 function failure(error51) {
   return { content: [{ type: "text", text: error51 instanceof Error ? error51.message : String(error51) }], isError: true };
 }
+function structuredFailure(code, error51, details = {}) {
+  return {
+    content: [{ type: "text", text: JSON.stringify({ ok: false, error: { code, message: error51 instanceof Error ? error51.message : String(error51), ...details } }, null, 2) }],
+    isError: true
+  };
+}
+function requireCompositionResult(data, requestedElementCount) {
+  const createdCount = Array.isArray(data?.createdNodeIds) ? data.createdNodeIds.length : 0;
+  const elementCount = Array.isArray(data?.elements) ? data.elements.length : 0;
+  if (!data?.frame?.id || createdCount !== requestedElementCount + 1 || elementCount !== requestedElementCount) {
+    const error51 = new Error(`Figma returned an incomplete composition: expected one root frame and ${requestedElementCount} native elements, received ${createdCount} created node IDs and ${elementCount} element records.`);
+    error51.code = "COMPOSITION_EMPTY_OR_INCOMPLETE";
+    throw error51;
+  }
+  return data;
+}
 var nodeId = external_exports.string().trim().min(1).max(200);
 var tokenId = external_exports.string().trim().min(1).max(300);
 var hexColor = external_exports.string().regex(/^#[0-9a-fA-F]{6}$/, "Use a six-digit hex colour such as #161238.");
 var opacity = external_exports.number().finite().min(0).max(1);
+var collisionPolicy = external_exports.enum(["reject", "report", "ignore"]);
 var position = {
   x: external_exports.number().finite().min(-1e5).max(1e5).default(0),
   y: external_exports.number().finite().min(-1e5).max(1e5).default(0)
@@ -32320,6 +32337,9 @@ var workflowInstructions = [
   "Before creating or replacing text, separate content from presentation. Author generated headings, labels and buttons in natural case; display uppercase, lowercase, title case or small caps with textCase or figma_set_text_case.",
   "Never pass all-caps characters merely to make text look uppercase. Preserve exact all-caps characters only when they are semantically intended, supplied as authoritative copy, or explicitly requested by the user.",
   "For a page re-layout: inspect and export the current artboard, list page tokens or copy style from verified source nodes, compose the named replacement with figma_compose_frame, archive explicit previous sibling nodes only after the replacement succeeds, then inspect the returned audit and PNG.",
+  "For a reference board or new canvas area: call figma_inspect_canvas_layout first, create a native SECTION with figma_create_section, and compose native frames inside it. Re-check the created node for collisions and use a targeted screenshot when visual overlap or adjacency matters.",
+  "Never use figma_import_svg for UI layouts, panels, boards, or editable labels. Reserve it for approved logos, icons, and isolated vector artwork; create UI text in natural case and apply Figma textCase for visual casing.",
+  "Treat COMPOSITION_EMPTY_OR_INCOMPLETE, any structured composition error, or a blank result as a hard stop. Do not fall back to SVG layout construction.",
   "Prefer figma_archive_nodes or figma_supersede_layout over deletion or opacity-zero superseded layers. Use approved local image paths only when the user placed that file in scope.",
   "Do not begin from arbitrary page traversal or the current selection when artboard discovery is available. Delete only a clearly stray, user-identified element; otherwise preserve it."
 ].join("\n");
@@ -32534,6 +32554,28 @@ server.registerTool("figma_query_page_nodes", {
 }, async (input) => {
   try {
     return output(await sendCommand("queryPageNodes", input));
+  } catch (error51) {
+    return failure(error51);
+  }
+});
+server.registerTool("figma_inspect_canvas_layout", {
+  title: "Inspect Figma canvas layout",
+  description: "List top-level canvas bounds and native sections, and optionally collision-check an existing node or proposed rectangle against visible siblings. Figma pages are unbounded; contentBounds reports the occupied canvas envelope.",
+  inputSchema: external_exports.object({
+    nodeId: nodeId.optional().describe("Existing node to collision-check against its siblings."),
+    proposed: external_exports.object({
+      ...position,
+      width: external_exports.number().finite().min(1).max(1e5),
+      height: external_exports.number().finite().min(1).max(1e5),
+      parentId: nodeId.optional().describe("Optional section/frame parent. Coordinates are relative to this parent.")
+    }).optional().describe("Proposed placement to collision-check before creating anything."),
+    ignoreNodeIds: external_exports.array(nodeId).max(250).default([]).describe("Known replacement/archive nodes to exclude from collision results."),
+    includeHidden: external_exports.boolean().default(false),
+    limit: external_exports.number().int().min(1).max(1e3).default(250)
+  }).refine((input) => !(input.nodeId && input.proposed), "Pass nodeId or proposed placement, not both.")
+}, async (input) => {
+  try {
+    return output(await sendCommand("inspectCanvasLayout", input));
   } catch (error51) {
     return failure(error51);
   }
@@ -32826,7 +32868,17 @@ server.registerTool("figma_compose_frame", {
   title: "Compose and verify a Figma frame",
   description: "Create one frame plus ordered panels, dividers, and styled-span text in a single guarded plugin command. On failure every newly created node is removed. Optionally archive previous sibling nodes only after composition succeeds, then audit and export the replacement.",
   inputSchema: {
-    frame: external_exports.object({ name: external_exports.string().trim().min(1).max(200), width: external_exports.number().finite().min(1).max(1e4), height: external_exports.number().finite().min(1).max(1e4), ...position, ...visualStyle }),
+    frame: external_exports.object({
+      name: external_exports.string().trim().min(1).max(200),
+      width: external_exports.number().finite().min(1).max(1e4),
+      height: external_exports.number().finite().min(1).max(1e4),
+      ...position,
+      parentId: nodeId.optional().describe("Optional native section or frame parent for the composed root frame."),
+      layout: external_exports.enum(["none", "horizontal", "vertical"]).default("none"),
+      itemSpacing: external_exports.number().finite().min(0).max(1e3).default(0),
+      padding: external_exports.number().finite().min(0).max(1e3).default(0),
+      ...visualStyle
+    }),
     elements: external_exports.array(composeFrameElement).min(1).max(100),
     archiveNodeIds: external_exports.array(nodeId).max(100).default([]),
     archiveName: external_exports.string().trim().min(1).max(200).default("Previous layout"),
@@ -32834,13 +32886,15 @@ server.registerTool("figma_compose_frame", {
     audit: external_exports.boolean().default(true),
     export: external_exports.boolean().default(true),
     maxDimension: external_exports.number().int().min(128).max(8192).default(4096),
-    scale: external_exports.number().finite().min(0.1).max(4).default(2)
+    scale: external_exports.number().finite().min(0.1).max(4).default(2),
+    collisionPolicy: collisionPolicy.default("reject").describe("Reject sibling overlap by default. Use report only for an intentional overlap; ignore suppresses the guard.")
   }
 }, async (input) => {
   try {
-    return output(await localizeBatchExports(await sendCommand("composeFrame", input, 3e5)));
+    const result = requireCompositionResult(await sendCommand("composeFrame", input, 3e5), input.elements.length);
+    return output(await localizeBatchExports(result));
   } catch (error51) {
-    return failure(error51);
+    return structuredFailure(error51?.code ?? "COMPOSITION_FAILED", error51, { requestedElementCount: input.elements.length });
   }
 });
 server.registerTool("figma_copy_style_from_node", {
@@ -33005,6 +33059,26 @@ server.registerTool("figma_create_frame", {
     return failure(error51);
   }
 });
+server.registerTool("figma_create_section", {
+  title: "Create Figma section",
+  description: "Create a native, page-level Figma section for organising reference boards or related artboards. Collision is rejected by default; inspect the canvas first and use report only for intentional overlap.",
+  inputSchema: {
+    name: external_exports.string().trim().min(1).max(200),
+    width: external_exports.number().finite().min(1).max(1e5),
+    height: external_exports.number().finite().min(1).max(1e5),
+    ...position,
+    fillColor: hexColor.optional(),
+    fillOpacity: opacity.optional(),
+    opacity: opacity.optional(),
+    collisionPolicy: collisionPolicy.default("reject")
+  }
+}, async (input) => {
+  try {
+    return output(await sendCommand("createSection", input));
+  } catch (error51) {
+    return failure(error51);
+  }
+});
 server.registerTool("figma_create_text", {
   title: "Create Figma text",
   description: "Create styled, editable text on the current Figma page. Supports typographic text case without rewriting the stored copy, styled spans, colour or a bound colour token, parent frame, fixed-width wrapping, alignment, line height, letter spacing, and opacity. It uses Inter Regular unless a different installed Figma font is supplied.",
@@ -33066,7 +33140,7 @@ server.registerTool("figma_create_ellipse", {
 });
 server.registerTool("figma_import_svg", {
   title: "Import SVG into Figma",
-  description: "Place an SVG string as editable vector artwork on the current page. Intended for approved SVG logo assets, icons, and simple decorative paths; it rejects scripts and event handlers.",
+  description: "Place an approved logo, icon, or isolated SVG vector asset on the current page. Never use this for UI layouts, panels, reference boards, or editable labels; use native sections, frames, components, and natural-case Figma text instead. Rejects scripts and event handlers.",
   inputSchema: {
     name: external_exports.string().trim().min(1).max(200),
     svg: external_exports.string().trim().min(20).max(2e5).refine((value) => /^<svg[\s>]/i.test(value), "SVG content must begin with an <svg> element.").refine((value) => !/<\s*(script|iframe|foreignObject)\b/i.test(value), "SVG may not contain scripts, iframes, or foreignObject elements.").refine((value) => !/\son\w+\s*=/i.test(value), "SVG may not contain event handlers."),

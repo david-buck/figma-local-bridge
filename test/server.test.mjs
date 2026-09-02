@@ -159,7 +159,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     capabilities: {},
     clientInfo: { name: "figma-bridge-test", version: "1.0.0" },
   });
-  assert.equal(initialized.serverInfo.version, "0.12.2");
+  assert.equal(initialized.serverInfo.version, "0.13.0");
   assert.match(initialized.instructions, /figma_prepare_review/);
   assert.match(initialized.instructions, /figma_apply_copy_updates/);
   rpc.notify("notifications/initialized");
@@ -172,7 +172,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     "figma_get_user_preferences", "figma_set_user_preference", "figma_delete_user_preference", "figma_revert_user_preferences", "figma_resolve_design_choice",
     "figma_list_design_system_assets", "figma_create_component_instance", "figma_apply_design_style",
     "figma_comment_status", "figma_list_comments", "figma_post_comment", "figma_delete_comment",
-    "figma_set_text_case",
+    "figma_set_text_case", "figma_inspect_canvas_layout", "figma_create_section",
   ]) {
     assert.ok(toolNames.has(name), `${name} should be advertised`);
   }
@@ -294,7 +294,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     capabilities: {},
     clientInfo: { name: "figma-bridge-proxy-test", version: "1.0.0" },
   });
-  assert.equal(proxyInitialized.serverInfo.version, "0.12.2");
+  assert.equal(proxyInitialized.serverInfo.version, "0.13.0");
   proxyRpc.notify("notifications/initialized");
   const proxyStatus = toolJson(await proxyRpc.request("tools/call", { name: "figma_bridge_status", arguments: {} }));
   assert.equal(proxyStatus.connected, true);
@@ -352,6 +352,50 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
   });
   assert.equal(eventHandlerSvg.isError, true);
   assert.match(eventHandlerSvg.content[0].text, /event handlers/);
+
+  const layoutWorker = serveOne("inspectCanvasLayout", (command) => {
+    assert.deepEqual(command.input, {
+      proposed: { x: 900, y: 0, width: 600, height: 500 },
+      ignoreNodeIds: [],
+      includeHidden: false,
+      limit: 250,
+    });
+    return {
+      page: { id: "0:1", name: "Campaign" },
+      contentBounds: { x: 0, y: 0, width: 800, height: 600 },
+      sections: [],
+      topLevelNodes: [],
+      collision: { clear: true, overlapCount: 0, overlaps: [] },
+    };
+  });
+  const inspectedLayout = toolJson(await rpc.request("tools/call", {
+    name: "figma_inspect_canvas_layout",
+    arguments: { proposed: { x: 900, y: 0, width: 600, height: 500 } },
+  }));
+  await layoutWorker;
+  assert.equal(inspectedLayout.collision.clear, true);
+
+  const sectionWorker = serveOne("createSection", (command) => {
+    assert.deepEqual(command.input, {
+      name: "Reference board",
+      width: 600,
+      height: 500,
+      x: 900,
+      y: 0,
+      collisionPolicy: "reject",
+    });
+    return {
+      createdNodeIds: ["10:1"],
+      section: { id: "10:1", name: "Reference board", type: "SECTION" },
+      placement: { clear: true, overlapCount: 0, overlaps: [] },
+    };
+  });
+  const createdSection = toolJson(await rpc.request("tools/call", {
+    name: "figma_create_section",
+    arguments: { name: "Reference board", width: 600, height: 500, x: 900, y: 0 },
+  }));
+  await sectionWorker;
+  assert.equal(createdSection.section.type, "SECTION");
 
   const commandNames = [];
   const fakePlugin = (async () => {
@@ -431,6 +475,22 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
   assert.equal(composed.exports[0].result.imageBase64, undefined);
   const composePng = await readFile(composed.exports[0].result.path);
   assert.deepEqual([...composePng.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+
+  const emptyComposeWorker = serveOne("composeFrame", () => ({}));
+  const emptyCompose = await rpc.request("tools/call", {
+    name: "figma_compose_frame",
+    arguments: {
+      frame: { name: "Empty response test", width: 300, height: 200, x: 800, y: 0 },
+      elements: [{ type: "rectangle", key: "panel", name: "Panel", width: 280, height: 180, x: 10, y: 10 }],
+      audit: false,
+      export: false,
+    },
+  });
+  await emptyComposeWorker;
+  assert.equal(emptyCompose.isError, true);
+  const emptyComposeError = JSON.parse(emptyCompose.content[0].text);
+  assert.equal(emptyComposeError.ok, false);
+  assert.equal(emptyComposeError.error.code, "COMPOSITION_EMPTY_OR_INCOMPLETE");
 
   const approvedImagePath = join(exportDirectory, "approved.png");
   await writeFile(approvedImagePath, Buffer.from(onePixelPng, "base64"));

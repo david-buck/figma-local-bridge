@@ -26,6 +26,8 @@ cd figma-local-bridge
 - Parent newly created nodes inside a frame or other compatible container.
 - List fonts installed in the open Figma desktop app before creating text.
 - Apply or remove auto-layout on a selected frame, component, component set, or instance.
+- Inspect native sections and occupied canvas bounds, and collision-check an existing or proposed placement.
+- Create native Figma sections for reference boards and related artboards.
 - List pages; navigate between them; query page nodes with IDs, bounds, hierarchy, and basic style metadata.
 - Return PNG screenshots of a node or the visible current page.
 - Move, resize, reparent, duplicate, select, read/update text in, or explicitly delete existing nodes.
@@ -39,7 +41,7 @@ cd figma-local-bridge
 - Apply multiple copy updates and return compact update verification, overflow audits, and local PNG paths in one MCP response.
 - Resize text frames, change auto-resize/truncation, or split a mixed-style text layer into heading and body while preserving its range styles.
 - Return summary frame/audit results by default to avoid oversized, truncated MCP responses; request full hierarchy only when needed.
-- Compose a replacement frame with panels, dividers, and styled-span text in one guarded command, then audit and export it.
+- Compose a native replacement frame inside the page or a section, with root auto-layout, panels, dividers, and styled-span text in one guarded command; empty or incomplete results fail explicitly.
 - Archive or supersede explicit sibling nodes into a hidden named group with replacement metadata instead of deleting them or leaving opacity-zero layers.
 - List verified local variables/styles plus colours and fonts used on the page, or copy style from a known on-brand node.
 - Discover verified local and currently used library components/styles, create linked component instances, and apply named styles by ID or key.
@@ -185,6 +187,7 @@ The bridge keeps its command surface intentionally narrow. It exposes the follow
 - `figma_list_fonts` — discover installed typefaces and style names.
 - `figma_list_pages` / `figma_navigate_to_page` — inspect and switch the active page.
 - `figma_query_page_nodes` — inspect node IDs, bounds, ancestry, child counts, and concise visual metadata.
+- `figma_inspect_canvas_layout` — list native sections and the occupied canvas envelope, or collision-check an existing/proposed placement against visible siblings.
 - `figma_screenshot` — return a PNG for a selected node or the visible page.
 - `figma_move_resize_reparent`, `figma_set_selection`, `figma_duplicate_node` — controlled structural editing.
 - `figma_read_text` / `figma_update_text` — inspect and replace existing editable text with its current fonts loaded first.
@@ -196,11 +199,12 @@ The bridge keeps its command surface intentionally narrow. It exposes the follow
 - `figma_delete_node` — permanently remove one identified node and its descendants; use only on an explicit user request.
 - `figma_read_frame_content` / `figma_read_spread_content` — ordered editorial copy with text-node IDs and hierarchy paths.
 - `figma_list_artboards` — clean page-level and section-level artboard list, excluding nested implementation frames.
+- `figma_create_section` — create a native reference-board/artboard section with collision rejection by default.
 - `figma_audit_text_overflow` — bounds and natural-size checks with actionable overflow and clipping warnings.
 - `figma_export_frame_png` — write a PNG to `~/Pictures/Figma MCP Exports` and return only its absolute path and dimensions.
 - `figma_prepare_review` — read one to eight ordered artboards, export them locally, and optionally audit their text in one non-mutating call.
 - `figma_archive_nodes` / `figma_supersede_layout` — hide explicit prior siblings in a named reversible group and record the replacement relationship.
-- `figma_compose_frame` — atomically create a frame, panels/dividers, and styled-span text, optionally archive previous content, then audit/export.
+- `figma_compose_frame` — atomically create a native frame in the page or a section, with root auto-layout, panels/dividers and styled-span text; reject accidental overlap and empty/incomplete results.
 - `figma_copy_style_from_node` / `figma_list_page_tokens` — inherit verified on-brand styling and discover local variables/styles plus page usage.
 - `figma_list_design_system_assets` — discover components, styles, and variables verified in the current file, including remote assets currently used and enabled linked-library variable collections.
 - `figma_create_component_instance` / `figma_apply_design_style` — create a linked instance or apply a named local/library style by verified ID or key.
@@ -211,7 +215,7 @@ The bridge keeps its command surface intentionally narrow. It exposes the follow
 - `figma_post_comment` — post a canvas- or frame-pinned comment, or reply to an existing comment.
 - `figma_delete_comment` — permanently delete one identified comment behind an explicit confirmation guard.
 
-For brand assets, read a trusted SVG file locally and pass its content to `figma_import_svg`; do not redraw logo artwork as text or paths.
+For brand assets, read a trusted SVG file locally and pass its content to `figma_import_svg`; do not redraw logo artwork as text or paths. SVG import is only for approved logos, icons and isolated vector artwork—not boards, UI layouts, panels or editable labels.
 
 ### Colour-token workflow
 
