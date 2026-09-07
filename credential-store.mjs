@@ -25,7 +25,7 @@ export async function runCredentialCommand(command, args, options = {}) {
     child.stderr.on("data", (chunk) => stderr.push(chunk));
     child.once("error", (error) => finish(reject, error));
     child.once("close", (code) => finish(resolve, {
-      code: code ?? 1,
+      code,
       stdout: Buffer.concat(stdout).toString("utf8"),
       stderr: Buffer.concat(stderr).toString("utf8"),
     }));
@@ -45,7 +45,9 @@ function macosBackend(run) {
     label: "macOS Keychain",
     async get() {
       const result = await run(security, ["find-generic-password", "-a", account, "-s", service, "-w"]);
-      if (result.code !== 0) return null;
+      // security also collapses search failures into item-not-found (44), so it
+      // cannot reliably confirm absence. Treat every nonzero status as unknown.
+      if (result.code !== 0) throw new Error("macOS Keychain could not read the credential.");
       return removeTransportNewline(result.stdout);
     },
     async set(secret) {
@@ -61,7 +63,7 @@ function macosBackend(run) {
     },
     async delete() {
       const result = await run(security, ["delete-generic-password", "-a", account, "-s", service]);
-      if (result.code !== 0 && await this.get()) throw new Error("macOS Keychain could not remove the credential.");
+      if (result.code !== 0) throw new Error("macOS Keychain could not confirm removal.");
     },
   };
 }
@@ -121,6 +123,12 @@ function windowsBackend(run, directory) {
   };
 }
 
+function secretServiceItemNotFound(result) {
+  // secret-tool uses status 1 for both absence and errors, printing errors to stderr.
+  // Other statuses or output cannot confirm absence; never expose backend diagnostics.
+  return result.code === 1 && result.stdout === "" && result.stderr === "";
+}
+
 function linuxBackend(run, environment) {
   return {
     id: "linux-secret-service",
@@ -128,7 +136,8 @@ function linuxBackend(run, environment) {
     async get() {
       if (!environment.DBUS_SESSION_BUS_ADDRESS) throw new Error("No desktop Secret Service session is available.");
       const result = await run("secret-tool", ["lookup", "service", service, "account", account]);
-      if (result.code !== 0) return null;
+      if (secretServiceItemNotFound(result)) return null;
+      if (result.code !== 0) throw new Error("Linux Secret Service could not read the credential.");
       return removeTransportNewline(result.stdout);
     },
     async set(secret) {
@@ -139,9 +148,9 @@ function linuxBackend(run, environment) {
       if (result.code !== 0) throw new Error("Linux Secret Service did not accept the credential.");
     },
     async delete() {
-      if (!environment.DBUS_SESSION_BUS_ADDRESS) return;
+      if (!environment.DBUS_SESSION_BUS_ADDRESS) throw new Error("No desktop Secret Service session is available.");
       const result = await run("secret-tool", ["clear", "service", service, "account", account]);
-      if (result.code !== 0 && await this.get()) throw new Error("Linux Secret Service could not remove the credential.");
+      if (result.code !== 0 && !secretServiceItemNotFound(result)) throw new Error("Linux Secret Service could not remove the credential.");
     },
   };
 }
@@ -196,7 +205,7 @@ export function createCredentialStore(options = {}) {
     async delete() {
       sessionSecret = null;
       try { await backend.delete(); } catch {
-        persistenceError = "The secure credential could not be removed automatically.";
+        persistenceError = "The secure credential store could not confirm removal.";
         throw new Error(persistenceError);
       }
       persistenceError = null;

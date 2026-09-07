@@ -24,7 +24,7 @@ async function loadPluginHelpers() {
     setInterval,
     setTimeout,
   });
-  vm.runInContext(`${source}\nglobalThis.__pluginTests = { pollQuery, activityForCommand, replaceTextPreservingStyles, visibilityInfo, auditTextOverflow, auditSummary, archiveNodes, createStyledText, composeFrame, canvasLayout, setTextFrame, setTextCase, splitTextBlock, createComponentInstance, applyDesignStyle, execute, figma };`, context);
+  vm.runInContext(`${source}\nglobalThis.__pluginTests = { pollQuery, activityForCommand, replaceTextPreservingStyles, visibilityInfo, auditTextOverflow, auditSummary, archiveNodes, createStyledText, composeFrame, canvasLayout, setTextFrame, setTextCase, splitTextBlock, createComponentInstance, applyDesignStyle, copyStyleFromNode, listDesignSystemAssets, execute, figma };`, context);
   return context.__pluginTests;
 }
 
@@ -291,6 +291,7 @@ test("named text styles load their font and apply by style ID", async () => {
   const text = {
     id: "5:1", name: "Heading", type: "TEXT", characters: "Natural case", width: 120, height: 24, visible: true, opacity: 1,
     fontName: { family: "Inter", style: "Regular" }, fontSize: 16, textAutoResize: "WIDTH_AND_HEIGHT",
+    getStyledTextSegments() { return [{ fontName: this.fontName }]; },
     async setTextStyleIdAsync(id) { this.appliedStyleId = id; },
   };
   configurePage(figma, [text]);
@@ -468,3 +469,227 @@ test("split utility preserves copy in separate heading and body layers", async (
   assert.deepEqual(Array.from(result.createdNodeIds), [`${source.id}-clone`]);
   assert.equal(parent.children[1].y, source.y + source.height + 12);
 });
+
+
+test("asset discovery loads document components using supported APIs and preserves page usage", async () => {
+  const { listDesignSystemAssets, figma } = await loadPluginHelpers();
+  const local = { id: "c", type: "COMPONENT", name: "Local", remote: false };
+  const remote = { id: "r", type: "COMPONENT", name: "Remote", remote: true };
+  const set = { id: "s", type: "COMPONENT_SET", name: "Set", remote: false };
+  const style = { id: "style", type: "PAINT", name: "Paint" };
+  configurePage(figma, [{ type: "INSTANCE", getMainComponentAsync: async () => remote, fillStyleId: style.id }, { type: "INSTANCE", getMainComponentAsync: async () => remote }]);
+  const currentPage = figma.currentPage;
+  const otherPage = configurePage(figma, [local, remote, set]);
+  figma.currentPage = currentPage;
+  let loaded = false;
+  figma.loadAllPagesAsync = async () => { loaded = true; };
+  figma.root = { findAllWithCriteria({ types }) { assert.equal(loaded, true); return [currentPage, otherPage].flatMap((page) => page.findAll((node) => types.includes(node.type))); } };
+  for (const kind of ["Paint", "Text", "Effect", "Grid"]) figma[`getLocal${kind}StylesAsync`] = async () => kind === "Paint" ? [style] : [];
+  figma.variables = { getLocalVariablesAsync: async () => [{ id: "v", name: "Token" }], getLocalVariableCollectionsAsync: async () => [{ id: "vc", variableIds: ["v"] }] };
+  figma.getNodeByIdAsync = async () => remote;
+  figma.getStyleByIdAsync = async () => style;
+  figma.teamLibrary = { getAvailableLibraryVariableCollectionsAsync: async () => { throw new Error("unavailable"); } };
+  const result = await listDesignSystemAssets({ scanLimit: 10, limit: 10, includeLinkedLibraries: true });
+  assert.deepEqual(Array.from(result.components.local, (node) => node.id), ["c"]);
+  assert.deepEqual(Array.from(result.components.localSets, (node) => node.id), ["s"]);
+  assert.equal(result.components.used[0].usageCount, 2);
+  assert.equal(result.styles.used[0].usageCount, 1);
+  assert.equal(result.variables.local[0].id, "v");
+  assert.match(result.warning, /unavailable/);
+  const limited = await listDesignSystemAssets({ scanLimit: 1, limit: 1 });
+  assert.equal(limited.components.used[0].usageCount, 1);
+  assert.equal(limited.scan.truncated, true);
+  configurePage(figma, []);
+  figma.root.findAllWithCriteria = () => [];
+  const empty = await listDesignSystemAssets({ scanLimit: 10, limit: 10 });
+  assert.equal(empty.components.local.length, 0);
+  assert.equal(empty.components.used.length, 0);
+});
+
+for (const failure of ["parent", "properties", "result"]) {
+  test(`failed component instance ${failure} removes only the new instance`, async () => {
+    const { createComponentInstance, figma } = await loadPluginHelpers();
+    const source = { id: "source", name: "Source", type: "COMPONENT" };
+    const unrelated = { id: "other", type: "FRAME" };
+    const page = configurePage(figma, [source, unrelated]);
+    let instance;
+    source.createInstance = () => {
+      instance = { id: "new", type: "INSTANCE", name: "New", remove() { this.removed = true; this.parent.children.splice(this.parent.children.indexOf(this), 1); }, setProperties() { if (failure === "properties") throw new Error("properties failed"); } };
+      page.appendChild(instance);
+      if (failure === "result") Object.defineProperty(instance, "componentProperties", { get() { throw new Error("result failed"); } });
+      return instance;
+    };
+    figma.getNodeByIdAsync = async () => source;
+    await assert.rejects(createComponentInstance({ componentId: source.id, parentId: failure === "parent" ? "missing" : undefined, x: 1, y: 2, componentProperties: { Variant: "invalid" } }));
+    assert.equal(instance.removed, true);
+    assert.deepEqual(page.children, [source, unrelated]);
+  });
+}
+
+function compositionFixture(figma, failure) {
+  const page = configurePage(figma, []);
+  page.insertChild = function(index, child) { this.appendChild(child); this.children.splice(this.children.indexOf(child), 1); this.children.splice(index, 0, child); };
+  let next = 0;
+  function make(type = "FRAME") {
+    const node = { id: `compose:${next++}`, name: type, type, visible: true, removed: false, x: 12, y: 24, width: 100, height: 100, relativeTransform: [[0, -1, 12], [1, 0, 24]], children: [], fills: [], strokes: [], opacity: 1, layoutMode: "NONE",
+      resize(width, height) { this.width = width; this.height = height; },
+      appendChild: page.appendChild,
+      remove() { this.removed = true; for (const child of [...this.children]) child.remove(); const at = this.parent.children.indexOf(this); if (at >= 0) this.parent.children.splice(at, 1); },
+      setPluginData(key, value) { if (failure === "metadata") throw new Error("metadata failed"); (this.data ??= {})[key] = value; },
+      async exportAsync() { if (failure === "export") throw new Error("export failed"); return new Uint8Array([1]); },
+    };
+    page.appendChild(node);
+    return node;
+  }
+  const leading = make(), first = make(), sibling = make(), second = make(), trailing = make();
+  const originalOrder = [leading, first, sibling, second, trailing];
+  second.visible = false;
+  figma.createFrame = () => { const root = make(); root.findAllWithCriteria = () => []; if (failure === "audit") { let reads = 0; Object.defineProperty(root, "absoluteBoundingBox", { get() { if (++reads > 1) throw new Error("audit failed"); return null; } }); } return root; };
+  figma.group = (nodes, parent) => {
+    const index = parent.children.indexOf(nodes[0]);
+    const group = make("GROUP");
+    parent.insertChild(index, group);
+    for (const node of nodes) { group.appendChild(node); node.x = 0; node.y = 0; node.relativeTransform = [[1, 0, 0], [0, 1, 0]]; }
+    if (failure === "group") throw new Error("group failed");
+    return group;
+  };
+  return { page, first, second, sibling, originalOrder, input: { frame: { name: "Replacement", x: 300, y: 300, width: 100, height: 100 }, elements: [], archiveNodeIds: [first.id, second.id], archiveName: "Archive", archiveReason: "Test", audit: failure === "audit", export: failure === "export" } };
+}
+
+for (const failure of ["export", "audit", "metadata", "group"]) {
+  test(`composition restores originals after ${failure} failure`, async () => {
+    const { composeFrame, figma } = await loadPluginHelpers();
+    const { page, first, second, originalOrder, input } = compositionFixture(figma, failure);
+    await assert.rejects(composeFrame(input), new RegExp(`${failure} failed`));
+    assert.deepEqual(page.children.map((node) => node.id), originalOrder.map((node) => node.id));
+    for (const node of [first, second]) {
+      assert.equal(node.parent, page);
+      assert.equal(node.removed, false);
+
+      assert.deepEqual(JSON.parse(JSON.stringify(node.relativeTransform)), [[0, -1, 12], [1, 0, 24]]);
+    }
+    assert.equal(first.visible, true);
+    assert.equal(second.visible, false);
+  });
+}
+
+test("composition archives originals only after verification and preserves replacement metadata", async () => {
+  const { composeFrame, figma } = await loadPluginHelpers();
+  const { page, first, second, input } = compositionFixture(figma);
+  const result = await composeFrame(input);
+  const archive = page.children.find((node) => node.type === "GROUP");
+  assert.equal(archive.visible, false);
+  assert.deepEqual(archive.children, [first, second]);
+  assert.equal(result.archived.replacementNodeId, result.frame.id);
+  assert.equal(archive.data["figma_local_bridge.replacementNodeId"], result.frame.id);
+  assert.equal(page.children.find((node) => node.id === result.frame.id).removed, false);
+});
+
+
+for (const failure of ["target", "style", "font"]) {
+  test(`named style preflights ${failure} failures before any mutation`, async () => {
+    const { applyDesignStyle, figma } = await loadPluginHelpers();
+    let writes = 0;
+    const first = styledText("first", "Text");
+    const second = failure === "target" ? { id: "second", type: "FRAME" } : styledText("second", "Text");
+    first.setTextStyleIdAsync = second.setTextStyleIdAsync = async () => { writes++; };
+    configurePage(figma, [first, second]);
+    figma.getStyleByIdAsync = async () => ({ id: "style", type: failure === "style" ? "PAINT" : "TEXT", fontName: { family: "Source", style: "Regular" } });
+    let loads = 0;
+    figma.loadFontAsync = async () => { if (failure === "font" && ++loads > 1) throw new Error("font failed"); };
+    await assert.rejects(applyDesignStyle({ targetNodeIds: [first.id, second.id], styleId: "style", aspect: "text" }));
+    assert.equal(writes, 0);
+  });
+}
+
+test("named paint style rejects incompatible style type without writes", async () => {
+  const { applyDesignStyle, figma } = await loadPluginHelpers();
+  let writes = 0;
+  configurePage(figma, [{ id: "target", type: "RECTANGLE", setFillStyleIdAsync: async () => { writes++; } }]);
+  figma.getStyleByIdAsync = async () => ({ id: "style", type: "EFFECT" });
+  await assert.rejects(applyDesignStyle({ targetNodeIds: ["target"], styleId: "style", aspect: "fill" }));
+  assert.equal(writes, 0);
+});
+
+for (const operation of ["named", "copy"]) {
+  test(`${operation} style setter failure reports exact partial target status`, async () => {
+    const { applyDesignStyle, copyStyleFromNode, figma } = await loadPluginHelpers();
+    const writes = [];
+    const source = { id: "source", type: "RECTANGLE", fills: [] };
+    const targets = ["a", "b", "c"].map((id) => {
+      const node = { id, type: "RECTANGLE" };
+      const set = () => { writes.push(id); if (id === "b") throw new Error("raw private failure details"); };
+      node.setFillStyleIdAsync = async () => set();
+      Object.defineProperty(node, "fills", { get: () => [], set });
+      return node;
+    });
+    configurePage(figma, [source, ...targets]);
+    figma.getStyleByIdAsync = async () => ({ id: "style", type: "PAINT" });
+    const result = operation === "named"
+      ? await applyDesignStyle({ targetNodeIds: targets.map((n) => n.id), styleId: "style", aspect: "fill" })
+      : await copyStyleFromNode({ sourceNodeId: source.id, targetNodeIds: targets.map((n) => n.id), aspects: ["fills"] });
+    assert.equal(result.ok, false);
+    assert.equal(result.partial, true);
+    assert.deepEqual(Array.from(result.completedNodeIds), ["a"]);
+    assert.deepEqual(Array.from(result.potentiallyMutatedNodeIds), ["b"]);
+    assert.deepEqual(Array.from(result.unattemptedNodeIds), ["c"]);
+    assert.deepEqual(writes, ["a", "b"]);
+    assert.doesNotMatch(result.error, /private/);
+  });
+}
+
+for (const failure of ["target", "font"]) {
+  test(`copy style preflights all visual and typography ${failure} requirements`, async () => {
+    const { copyStyleFromNode, figma } = await loadPluginHelpers();
+    const source = styledText("source", "Source"), first = styledText("first", "Text");
+    const second = failure === "target" ? { id: "second", type: "FRAME" } : styledText("second", "Text");
+    source.fills = [{ type: "SOLID" }];
+    let writes = 0;
+    for (const target of [first, second]) Object.defineProperty(target, "fills", { get: () => [], set() { writes++; } });
+    second.fontName = { family: "Unavailable", style: "Regular" };
+    configurePage(figma, [source, first, second]);
+    figma.loadFontAsync = async (font) => { if (failure === "font" && font.family === "Unavailable") throw new Error("font failed"); };
+    await assert.rejects(copyStyleFromNode({ sourceNodeId: source.id, targetNodeIds: [first.id, second.id], aspects: ["fills", "typography"], textSource: "first-span" }));
+    assert.equal(writes, 0);
+  });
+}
+
+
+test("copy style supports first-span mixed typography and visual aspects", async () => {
+  const { copyStyleFromNode, figma } = await loadPluginHelpers();
+  const source = styledText("source", "Mixed"), target = styledText("target", "Unchanged copy");
+  source.fontName = figma.mixed;
+  source.fills = figma.mixed;
+  source.effects = [{ type: "LAYER_BLUR", radius: 4, visible: true }];
+  target.effects = [];
+  target.fills = [];
+  source.getStyledTextSegments = () => [{ fontName: { family: "Source", style: "Bold" }, fontSize: 20, textCase: "UPPER", lineHeight: { unit: "AUTO" }, letterSpacing: { unit: "PIXELS", value: 0 }, fills: [] }];
+  const loaded = [];
+  figma.loadFontAsync = async (font) => { loaded.push(font.family); };
+  configurePage(figma, [source, target]);
+  const result = await copyStyleFromNode({ sourceNodeId: source.id, targetNodeIds: [target.id], aspects: ["fills", "effects", "typography", "corners"], textSource: "first-span" });
+  assert.deepEqual(Array.from(result.mutatedNodeIds), [target.id]);
+  assert.equal(result.partial, undefined);
+  assert.equal(target.characters, "Unchanged copy");
+  assert.equal(target.fontName.family, "Source");
+  assert.equal(target.effects[0].radius, 4);
+  assert.deepEqual(loaded, ["Source", "Inter"]);
+});
+
+for (const operation of ["named", "copy"]) {
+  test(`${operation} style reports completed writes when viewport preparation fails`, async () => {
+    const { applyDesignStyle, copyStyleFromNode, figma } = await loadPluginHelpers();
+    const source = { id: "source", type: "RECTANGLE", fills: [] };
+    const target = { id: "target", type: "RECTANGLE", fills: [], setFillStyleIdAsync: async () => {} };
+    configurePage(figma, [source, target]);
+    figma.getStyleByIdAsync = async () => ({ id: "style", type: "PAINT" });
+    figma.viewport.scrollAndZoomIntoView = () => { throw new Error("viewport failed"); };
+    const result = operation === "named"
+      ? await applyDesignStyle({ targetNodeIds: [target.id], styleId: "style", aspect: "fill" })
+      : await copyStyleFromNode({ sourceNodeId: source.id, targetNodeIds: [target.id], aspects: ["fills"] });
+    assert.equal(result.partial, true);
+    assert.deepEqual(Array.from(result.completedNodeIds), [target.id]);
+    assert.equal(result.potentiallyMutatedNodeIds.length, 0);
+    assert.equal(result.unattemptedNodeIds.length, 0);
+  });
+}

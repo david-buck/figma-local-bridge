@@ -1059,17 +1059,45 @@ function validateArchiveNodes(nodeIds, replacementNodeId) {
 
 function archiveNodes(input, prepared) {
   const { nodes, parent, replacement } = prepared ?? validateArchiveNodes(input.nodeIds, input.replacementNodeId);
-  const group = figma.group(nodes, parent);
-  group.name = input.archiveName;
-  group.setPluginData("figma_local_bridge.archivedAt", new Date().toISOString());
-  group.setPluginData("figma_local_bridge.replacementNodeId", replacement?.id ?? "");
-  group.setPluginData("figma_local_bridge.reason", input.reason ?? "");
-  group.visible = false;
-  return {
-    createdNodeIds: [group.id],
-    mutatedNodeIds: nodes.map((node) => node.id),
-    archive: { id: group.id, name: group.name, hidden: true, archivedNodeIds: nodes.map((node) => node.id), replacementNodeId: replacement?.id ?? null, reason: input.reason ?? null },
-  };
+  const previousChildren = new Set(parent.children);
+  const snapshots = nodes.map((node) => ({ node, index: parent.children.indexOf(node), visible: node.visible, x: node.x, y: node.y, transform: node.relativeTransform ? cloneValue(node.relativeTransform) : null }));
+  let group;
+  try {
+    group = figma.group(nodes, parent);
+    group.name = input.archiveName;
+    group.setPluginData("figma_local_bridge.archivedAt", new Date().toISOString());
+    group.setPluginData("figma_local_bridge.replacementNodeId", replacement?.id ?? "");
+    group.setPluginData("figma_local_bridge.reason", input.reason ?? "");
+    group.visible = false;
+    return {
+      createdNodeIds: [group.id],
+      mutatedNodeIds: nodes.map((node) => node.id),
+      archive: { id: group.id, name: group.name, hidden: true, archivedNodeIds: nodes.map((node) => node.id), replacementNodeId: replacement?.id ?? null, reason: input.reason ?? null },
+    };
+  } catch (error) {
+    // Grouping may throw after reparenting, before returning the new group.
+    const groups = new Set([group, ...parent.children.filter((node) => !previousChildren.has(node) && node.type === "GROUP")].filter(Boolean));
+    const unrestored = [];
+    // Evacuate originals before removing temporary groups, so their indices
+    // cannot displace unaffected siblings during final order restoration.
+    for (const snapshot of snapshots) {
+      try { parent.appendChild(snapshot.node); }
+      catch (_) { unrestored.push(snapshot.node.id); }
+    }
+    for (const candidate of groups) if (!candidate.removed && candidate.children.length === 0) candidate.remove();
+    for (const snapshot of snapshots.sort((a, b) => a.index - b.index)) {
+      try {
+        parent.insertChild(snapshot.index, snapshot.node);
+        snapshot.node.visible = snapshot.visible;
+        if (snapshot.transform) snapshot.node.relativeTransform = snapshot.transform;
+        else { snapshot.node.x = snapshot.x; snapshot.node.y = snapshot.y; }
+      } catch (_) {
+        unrestored.push(snapshot.node.id);
+      }
+    }
+    if (unrestored.length) throw new Error(`Archive failed and originals ${unrestored.join(", ")} could not be fully restored. Inspect these nodes before retrying.`);
+    throw error;
+  }
 }
 
 async function composeFrame(input) {
@@ -1130,22 +1158,24 @@ async function composeFrame(input) {
       throw new Error(`Composition created ${created.length - 1} of ${input.elements.length} requested native elements.`);
     }
 
-    let archived = null;
-    if (preparedArchive) archived = archiveNodes({ nodeIds: input.archiveNodeIds, replacementNodeId: root.id, archiveName: input.archiveName, reason: input.archiveReason }, { ...preparedArchive, replacement: root });
     const audits = input.audit ? [{ frameId: root.id, result: auditSummary(await auditTextOverflow(root, { includeHidden: false })) }] : [];
     const exports = input.export ? [{ frameId: root.id, result: { ...(await screenshotNode(root, input)), nodeName: root.name } }] : [];
     focus(root);
-    return {
+    const result = {
       ok: true,
       createdNodeIds: created.map((node) => node.id),
       frame: serializeNode(root),
       elements: [...byKey].map(([key, node]) => ({ key, id: node.id, name: node.name, type: node.type })),
       placement,
-      ...(archived ? { archived: archived.archive } : {}),
       audits,
       exports,
       verificationComplete: audits.every((item) => !item.error) && exports.every((item) => !item.error),
     };
+    if (preparedArchive) {
+      const archived = archiveNodes({ nodeIds: input.archiveNodeIds, replacementNodeId: root.id, archiveName: input.archiveName, reason: input.archiveReason }, { ...preparedArchive, replacement: root });
+      result.archived = archived.archive;
+    }
+    return result;
   } catch (error) {
     if (!root.removed) root.remove();
     throw error;
@@ -1226,8 +1256,12 @@ async function listDesignSystemAssets(input) {
       }
     }
   }
-  const [localComponents, localComponentSets, localPaintStyles, localTextStyles, localEffectStyles, localGridStyles, localVariables, localCollections] = await Promise.all([
-    figma.getLocalComponentsAsync(), figma.getLocalComponentSetsAsync(), figma.getLocalPaintStylesAsync(), figma.getLocalTextStylesAsync(),
+  await figma.loadAllPagesAsync();
+  const definitions = figma.root.findAllWithCriteria({ types: ["COMPONENT", "COMPONENT_SET"] }).filter((node) => !node.remote);
+  const localComponents = definitions.filter((node) => node.type === "COMPONENT");
+  const localComponentSets = definitions.filter((node) => node.type === "COMPONENT_SET");
+  const [localPaintStyles, localTextStyles, localEffectStyles, localGridStyles, localVariables, localCollections] = await Promise.all([
+    figma.getLocalPaintStylesAsync(), figma.getLocalTextStylesAsync(),
     figma.getLocalEffectStylesAsync(), figma.getLocalGridStylesAsync(), figma.variables.getLocalVariablesAsync(), figma.variables.getLocalVariableCollectionsAsync(),
   ]);
   const usedComponents = [];
@@ -1280,38 +1314,53 @@ async function createComponentInstance(input) {
     component = await figma.importComponentByKeyAsync(input.componentKey);
   }
   const instance = component.createInstance();
-  appendToParent(instance, input.parentId);
-  instance.name = input.name ?? component.name;
-  instance.x = input.x;
-  instance.y = input.y;
-  if (input.componentProperties && Object.keys(input.componentProperties).length) instance.setProperties(input.componentProperties);
-  focus(instance);
-  return { createdNodeIds: [instance.id], component: componentSummary(component), instance: serializeNode(instance), componentProperties: cloneValue(instance.componentProperties ?? {}) };
+  try {
+    appendToParent(instance, input.parentId);
+    instance.name = input.name ?? component.name;
+    instance.x = input.x;
+    instance.y = input.y;
+    if (input.componentProperties && Object.keys(input.componentProperties).length) instance.setProperties(input.componentProperties);
+    focus(instance);
+    return { createdNodeIds: [instance.id], component: componentSummary(component), instance: serializeNode(instance), componentProperties: cloneValue(instance.componentProperties ?? {}) };
+  } catch (error) {
+    removeFailedCreation(instance, error);
+  }
+}
+
+function partialStyleResult(targets, completedCount, hasCurrentTarget) {
+  return {
+    ok: false,
+    partial: true,
+    completedNodeIds: targets.slice(0, completedCount).map((node) => node.id),
+    potentiallyMutatedNodeIds: hasCurrentTarget ? [targets[completedCount].id] : [],
+    unattemptedNodeIds: targets.slice(completedCount + (hasCurrentTarget ? 1 : 0)).map((node) => node.id),
+    error: "Figma could not complete the style operation. Re-read the affected nodes before retrying.",
+  };
 }
 
 async function applyDesignStyle(input) {
   const style = input.styleId ? await figma.getStyleByIdAsync(input.styleId) : await figma.importStyleByKeyAsync(input.styleKey);
   if (!style) throw new Error("The requested Figma style was not found.");
   const targets = input.targetNodeIds.map(sceneNode);
+  const styleTypes = { fill: "PAINT", stroke: "PAINT", effect: "EFFECT", text: "TEXT" };
+  const methods = { fill: "setFillStyleIdAsync", stroke: "setStrokeStyleIdAsync", effect: "setEffectStyleIdAsync", text: "setTextStyleIdAsync" };
+  const method = methods[input.aspect];
+  if (!method || style.type !== styleTypes[input.aspect]) throw new Error(`The requested style is incompatible with aspect ${input.aspect}.`);
   for (const target of targets) {
-    if (input.aspect === "fill") {
-      if (!("setFillStyleIdAsync" in target)) throw new Error(`Node ${target.id} cannot accept a fill style.`);
-      await target.setFillStyleIdAsync(style.id);
-    } else if (input.aspect === "stroke") {
-      if (!("setStrokeStyleIdAsync" in target)) throw new Error(`Node ${target.id} cannot accept a stroke style.`);
-      await target.setStrokeStyleIdAsync(style.id);
-    } else if (input.aspect === "effect") {
-      if (!("setEffectStyleIdAsync" in target)) throw new Error(`Node ${target.id} cannot accept an effect style.`);
-      await target.setEffectStyleIdAsync(style.id);
-    } else {
-      if (target.type !== "TEXT" || !("setTextStyleIdAsync" in target)) throw new Error(`Node ${target.id} cannot accept a text style.`);
-      if (style.type !== "TEXT") throw new Error(`Style ${style.name} is not a text style.`);
-      await figma.loadFontAsync(style.fontName);
-      await target.setTextStyleIdAsync(style.id);
-    }
+    if (typeof target[method] !== "function" || (input.aspect === "text" && target.type !== "TEXT")) throw new Error(`Node ${target.id} cannot accept a ${input.aspect} style.`);
   }
-  if (targets.length) figma.viewport.scrollAndZoomIntoView(targets);
-  return { style: styleSummary(style), aspect: input.aspect, mutatedNodeIds: targets.map((target) => target.id), targets: targets.map(serializeNode) };
+  if (input.aspect === "text") {
+    for (const target of targets) await loadCurrentTextFonts(target);
+    await figma.loadFontAsync(style.fontName);
+  }
+  for (let index = 0; index < targets.length; index++) {
+    try { await targets[index][method](style.id); }
+    catch (_) { return partialStyleResult(targets, index, true); }
+  }
+  try {
+    if (targets.length) figma.viewport.scrollAndZoomIntoView(targets);
+    return { style: styleSummary(style), aspect: input.aspect, mutatedNodeIds: targets.map((target) => target.id), targets: targets.map(serializeNode) };
+  } catch (_) { return partialStyleResult(targets, targets.length, false); }
 }
 
 async function copyStyleFromNode(input) {
@@ -1325,28 +1374,35 @@ async function copyStyleFromNode(input) {
     textStyle = segment ?? { fontName: source.fontName, fontSize: source.fontSize, lineHeight: source.lineHeight, letterSpacing: source.letterSpacing, textCase: source.textCase, fills: source.fills };
     await figma.loadFontAsync(textStyle.fontName);
   }
-  for (const target of targets) {
-    if (input.aspects.includes("fills") && "fills" in source && "fills" in target && source.fills !== figma.mixed) target.fills = cloneValue(source.fills);
-    if (input.aspects.includes("strokes") && "strokes" in source && "strokes" in target && source.strokes !== figma.mixed) {
-      target.strokes = cloneValue(source.strokes);
-      if ("strokeWeight" in source && "strokeWeight" in target && source.strokeWeight !== figma.mixed) target.strokeWeight = source.strokeWeight;
-    }
-    if (input.aspects.includes("effects") && "effects" in source && "effects" in target) target.effects = cloneValue(source.effects);
-    if (input.aspects.includes("corners") && "cornerRadius" in source && "cornerRadius" in target && source.cornerRadius !== figma.mixed) target.cornerRadius = source.cornerRadius;
-    if (input.aspects.includes("opacity") && "opacity" in source && "opacity" in target) target.opacity = source.opacity;
-    if (input.aspects.includes("typography")) {
-      if (target.type !== "TEXT") throw new Error(`Typography target ${target.id} is not text.`);
-      await loadCurrentTextFonts(target);
-      target.fontName = textStyle.fontName;
-      target.fontSize = textStyle.fontSize;
-      target.lineHeight = textStyle.lineHeight;
-      target.letterSpacing = textStyle.letterSpacing;
-      target.textCase = textStyle.textCase;
-      if (textStyle.fills && textStyle.fills !== figma.mixed) target.fills = cloneValue(textStyle.fills);
-    }
+  if (textStyle) {
+    for (const target of targets) if (target.type !== "TEXT") throw new Error(`Typography target ${target.id} is not text.`);
+    for (const target of targets) await loadCurrentTextFonts(target);
   }
-  if (targets.length) figma.viewport.scrollAndZoomIntoView(targets);
-  return { sourceNodeId: source.id, mutatedNodeIds: targets.map((node) => node.id), targets: targets.map(serializeNode), aspects: input.aspects };
+  for (let index = 0; index < targets.length; index++) {
+    const target = targets[index];
+    try {
+      if (input.aspects.includes("fills") && "fills" in source && "fills" in target && source.fills !== figma.mixed) target.fills = cloneValue(source.fills);
+      if (input.aspects.includes("strokes") && "strokes" in source && "strokes" in target && source.strokes !== figma.mixed) {
+        target.strokes = cloneValue(source.strokes);
+        if ("strokeWeight" in source && "strokeWeight" in target && source.strokeWeight !== figma.mixed) target.strokeWeight = source.strokeWeight;
+      }
+      if (input.aspects.includes("effects") && "effects" in source && "effects" in target) target.effects = cloneValue(source.effects);
+      if (input.aspects.includes("corners") && "cornerRadius" in source && "cornerRadius" in target && source.cornerRadius !== figma.mixed) target.cornerRadius = source.cornerRadius;
+      if (input.aspects.includes("opacity") && "opacity" in source && "opacity" in target) target.opacity = source.opacity;
+      if (input.aspects.includes("typography")) {
+        target.fontName = textStyle.fontName;
+        target.fontSize = textStyle.fontSize;
+        target.lineHeight = textStyle.lineHeight;
+        target.letterSpacing = textStyle.letterSpacing;
+        target.textCase = textStyle.textCase;
+        if (textStyle.fills && textStyle.fills !== figma.mixed) target.fills = cloneValue(textStyle.fills);
+      }
+    } catch (_) { return partialStyleResult(targets, index, true); }
+  }
+  try {
+    if (targets.length) figma.viewport.scrollAndZoomIntoView(targets);
+    return { sourceNodeId: source.id, mutatedNodeIds: targets.map((node) => node.id), targets: targets.map(serializeNode), aspects: input.aspects };
+  } catch (_) { return partialStyleResult(targets, targets.length, false); }
 }
 
 function imageFill(node) {

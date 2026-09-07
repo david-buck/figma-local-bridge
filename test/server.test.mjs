@@ -6,6 +6,7 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import vm from "node:vm";
 
 const onePixelPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
@@ -589,4 +590,111 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
   assert.equal(failoverMcpStatus.mcpProcess.role, "owner");
   assert.equal(stderr, "");
   assert.equal(proxyStderr, "");
+});
+
+// Execute the actual transport handlers with controlled timers and no listening socket.
+async function commandHarness() {
+  const source = await readFile(new URL("../server.mjs", import.meta.url), "utf8");
+  const session = { queue: [], pending: new Map(), poll: null };
+  const timers = new Map();
+  let nextId = 0;
+  let handler;
+  const sandbox = {
+    URL,
+    http: { createServer(callback) { handler = callback; } },
+    host: "127.0.0.1", port: 0,
+    activeSessions: () => [session],
+    getSession: () => session,
+    updateSession() {},
+    isAllowedBrowserOrigin: () => true,
+    readJson: async (request) => request.body,
+    randomUUID: () => `command-${++nextId}`,
+    setTimeout(callback) { const token = ++nextId; timers.set(token, callback); return token; },
+    clearTimeout: (token) => timers.delete(token),
+    json(response, status, body) { response.status = status; response.body = body; },
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(
+    source.slice(source.indexOf("function completePoll("), source.indexOf("function addSession(")) +
+    source.slice(source.indexOf("const bridge = http.createServer("), source.indexOf("async function ownerRequest(")), sandbox,
+  );
+  return {
+    session,
+    send: () => sandbox.sendLocalCommand("mutate", {}, 1_000),
+    expire() {
+      const [token, callback] = timers.entries().next().value;
+      timers.delete(token);
+      callback();
+    },
+    completePoll: () => sandbox.completePoll(session),
+    async request(method, url, body) {
+      const response = { once() {} };
+      await handler({ method, url, body, headers: {}, once() {} }, response);
+      return response;
+    },
+  };
+}
+
+test("queued timeout removes the command before polling resumes", async () => {
+  const harness = await commandHarness();
+  const result = harness.send();
+  const rejected = assert.rejects(result, /Figma did not respond/i);
+  harness.expire();
+  await rejected;
+  assert.equal(harness.session.queue.length, 0);
+  const poll = await harness.request("GET", "/v1/poll?sessionId=test");
+  assert.equal(poll.body, undefined);
+  assert.ok(harness.session.poll);
+});
+
+for (const delivery of ["immediate", "waiting"]) {
+  test(`${delivery} poll skips stale entries and delivers live commands once in order`, async () => {
+    const harness = await commandHarness();
+    harness.session.queue.push({ id: "stale", name: "mutate", input: {} });
+    const first = harness.send();
+    const second = harness.send();
+    let poll;
+    if (delivery === "immediate") {
+      poll = await harness.request("GET", "/v1/poll?sessionId=test");
+    } else {
+      poll = {};
+      harness.session.poll = { response: poll, timeout: null };
+      harness.completePoll();
+    }
+    assert.equal(poll.body.command.id, "command-1");
+    const secondPoll = await harness.request("GET", "/v1/poll?sessionId=test");
+    assert.equal(secondPoll.body.command.id, "command-3");
+    for (const command of [poll.body.command, secondPoll.body.command]) {
+      const response = await harness.request("POST", "/v1/result", { sessionId: "test", id: command.id, ok: true, result: command.id });
+      assert.equal(response.status, 204);
+    }
+    assert.deepEqual(await Promise.all([first, second]), ["command-1", "command-3"]);
+    const emptyPoll = await harness.request("GET", "/v1/poll?sessionId=test");
+    assert.equal(emptyPoll.body, undefined);
+  });
+}
+
+test("waiting poll preserves ordinary success and clears its command timeout", async () => {
+  const harness = await commandHarness();
+  const poll = await harness.request("GET", "/v1/poll?sessionId=test");
+  const result = harness.send();
+  assert.equal(poll.status, 200);
+  const response = await harness.request("POST", "/v1/result", { id: poll.body.command.id, ok: true, result: { changed: true } });
+  assert.equal(response.status, 204);
+  assert.deepEqual(await result, { changed: true });
+  assert.equal(harness.session.pending.size, 0);
+  assert.equal(harness.session.queue.length, 0);
+});
+
+test("dispatched timeout reports an unknown outcome and ignores a late result", async () => {
+  const harness = await commandHarness();
+  const result = harness.send();
+  const poll = await harness.request("GET", "/v1/poll?sessionId=test");
+  const rejected = assert.rejects(result, /outcome is unknown.*re-read.*before retrying/i);
+  harness.expire();
+  await rejected;
+  const late = await harness.request("POST", "/v1/result", { id: poll.body.command.id, ok: true, result: { changed: true } });
+  assert.equal(late.status, 404);
+  assert.equal(harness.session.pending.size, 0);
+  assert.equal(harness.session.queue.length, 0);
 });

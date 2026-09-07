@@ -222,11 +222,21 @@ const statusPage = `<!doctype html>
 </html>`;
 
 function completePoll(session) {
-  if (!session.poll || session.queue.length === 0) return;
+  if (!session.poll) return;
+  const command = dequeuePendingCommand(session);
+  if (!command) return;
   const poll = session.poll;
   session.poll = null;
   clearTimeout(poll.timeout);
-  json(poll.response, 200, { command: session.queue.shift() });
+  json(poll.response, 200, { command });
+}
+
+function dequeuePendingCommand(session) {
+  while (session.queue.length > 0) {
+    const command = session.queue.shift();
+    if (session.pending.has(command.id)) return command;
+  }
+  return null;
 }
 
 function addSession(body) {
@@ -351,7 +361,8 @@ const bridge = http.createServer(async (request, response) => {
         selectionCount: Number.parseInt(url.searchParams.get("selectionCount") ?? "", 10),
       });
       if (session.poll) return json(response, 409, { error: "Only one active poll is permitted per session." });
-      if (session.queue.length > 0) return json(response, 200, { command: session.queue.shift() });
+      const command = dequeuePendingCommand(session);
+      if (command) return json(response, 200, { command });
       const timeout = setTimeout(() => {
         if (session.poll?.response === response) {
           session.poll = null;
@@ -424,7 +435,12 @@ function sendLocalCommand(name, input, timeoutMs = 30_000) {
   const result = new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       session.pending.delete(id);
-      reject(new Error(`Figma did not respond within ${Math.round(timeoutMs / 1_000)} seconds. Confirm the bridge plugin is still open and connected.`));
+      const queuedIndex = session.queue.findIndex((queued) => queued.id === id);
+      if (queuedIndex !== -1) session.queue.splice(queuedIndex, 1);
+      const outcome = queuedIndex !== -1
+        ? "The command was not dispatched and has been removed from the queue. Confirm the bridge plugin is still open and connected."
+        : "The command was dispatched, so its outcome is unknown. Re-read the affected Figma state before retrying.";
+      reject(new Error(`Figma did not respond within ${Math.round(timeoutMs / 1_000)} seconds. ${outcome}`));
     }, timeoutMs);
     session.pending.set(id, { resolve, reject, timeout });
   });

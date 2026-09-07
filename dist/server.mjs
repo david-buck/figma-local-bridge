@@ -31032,7 +31032,7 @@ async function runCredentialCommand(command, args, options = {}) {
     child.stderr.on("data", (chunk) => stderr.push(chunk));
     child.once("error", (error51) => finish(reject, error51));
     child.once("close", (code) => finish(resolve, {
-      code: code ?? 1,
+      code,
       stdout: Buffer.concat(stdout).toString("utf8"),
       stderr: Buffer.concat(stderr).toString("utf8")
     }));
@@ -31050,7 +31050,7 @@ function macosBackend(run) {
     label: "macOS Keychain",
     async get() {
       const result = await run(security, ["find-generic-password", "-a", account, "-s", service, "-w"]);
-      if (result.code !== 0) return null;
+      if (result.code !== 0) throw new Error("macOS Keychain could not read the credential.");
       return removeTransportNewline(result.stdout);
     },
     async set(secret) {
@@ -31069,7 +31069,7 @@ ${secret}
     },
     async delete() {
       const result = await run(security, ["delete-generic-password", "-a", account, "-s", service]);
-      if (result.code !== 0 && await this.get()) throw new Error("macOS Keychain could not remove the credential.");
+      if (result.code !== 0) throw new Error("macOS Keychain could not confirm removal.");
     }
   };
 }
@@ -31128,6 +31128,9 @@ function windowsBackend(run, directory) {
     }
   };
 }
+function secretServiceItemNotFound(result) {
+  return result.code === 1 && result.stdout === "" && result.stderr === "";
+}
 function linuxBackend(run, environment) {
   return {
     id: "linux-secret-service",
@@ -31135,7 +31138,8 @@ function linuxBackend(run, environment) {
     async get() {
       if (!environment.DBUS_SESSION_BUS_ADDRESS) throw new Error("No desktop Secret Service session is available.");
       const result = await run("secret-tool", ["lookup", "service", service, "account", account]);
-      if (result.code !== 0) return null;
+      if (secretServiceItemNotFound(result)) return null;
+      if (result.code !== 0) throw new Error("Linux Secret Service could not read the credential.");
       return removeTransportNewline(result.stdout);
     },
     async set(secret) {
@@ -31152,9 +31156,9 @@ function linuxBackend(run, environment) {
       if (result.code !== 0) throw new Error("Linux Secret Service did not accept the credential.");
     },
     async delete() {
-      if (!environment.DBUS_SESSION_BUS_ADDRESS) return;
+      if (!environment.DBUS_SESSION_BUS_ADDRESS) throw new Error("No desktop Secret Service session is available.");
       const result = await run("secret-tool", ["clear", "service", service, "account", account]);
-      if (result.code !== 0 && await this.get()) throw new Error("Linux Secret Service could not remove the credential.");
+      if (result.code !== 0 && !secretServiceItemNotFound(result)) throw new Error("Linux Secret Service could not remove the credential.");
     }
   };
 }
@@ -31206,7 +31210,7 @@ function createCredentialStore(options = {}) {
       try {
         await backend.delete();
       } catch {
-        persistenceError = "The secure credential could not be removed automatically.";
+        persistenceError = "The secure credential store could not confirm removal.";
         throw new Error(persistenceError);
       }
       persistenceError = null;
@@ -31425,11 +31429,20 @@ var statusPage = `<!doctype html>
   </body>
 </html>`;
 function completePoll(session) {
-  if (!session.poll || session.queue.length === 0) return;
+  if (!session.poll) return;
+  const command = dequeuePendingCommand(session);
+  if (!command) return;
   const poll = session.poll;
   session.poll = null;
   clearTimeout(poll.timeout);
-  json2(poll.response, 200, { command: session.queue.shift() });
+  json2(poll.response, 200, { command });
+}
+function dequeuePendingCommand(session) {
+  while (session.queue.length > 0) {
+    const command = session.queue.shift();
+    if (session.pending.has(command.id)) return command;
+  }
+  return null;
 }
 function addSession(body) {
   cleanReplacedSessions();
@@ -31540,7 +31553,8 @@ var bridge = http.createServer(async (request, response) => {
         selectionCount: Number.parseInt(url2.searchParams.get("selectionCount") ?? "", 10)
       });
       if (session.poll) return json2(response, 409, { error: "Only one active poll is permitted per session." });
-      if (session.queue.length > 0) return json2(response, 200, { command: session.queue.shift() });
+      const command = dequeuePendingCommand(session);
+      if (command) return json2(response, 200, { command });
       const timeout = setTimeout(() => {
         if (session.poll?.response === response) {
           session.poll = null;
@@ -31605,7 +31619,10 @@ function sendLocalCommand(name, input, timeoutMs = 3e4) {
   const result = new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       session.pending.delete(id);
-      reject(new Error(`Figma did not respond within ${Math.round(timeoutMs / 1e3)} seconds. Confirm the bridge plugin is still open and connected.`));
+      const queuedIndex = session.queue.findIndex((queued) => queued.id === id);
+      if (queuedIndex !== -1) session.queue.splice(queuedIndex, 1);
+      const outcome = queuedIndex !== -1 ? "The command was not dispatched and has been removed from the queue. Confirm the bridge plugin is still open and connected." : "The command was dispatched, so its outcome is unknown. Re-read the affected Figma state before retrying.";
+      reject(new Error(`Figma did not respond within ${Math.round(timeoutMs / 1e3)} seconds. ${outcome}`));
     }, timeoutMs);
     session.pending.set(id, { resolve, reject, timeout });
   });
