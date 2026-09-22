@@ -132,7 +132,7 @@ The MCP advertises this sequence in its server instructions, and the companion p
 7. Only then edit identified nodes
 8. Re-read and re-audit; re-export only when the change needs visual verification
 
-After artboard discovery, `figma_prepare_review` is the faster equivalent for one to eight known artboards. It performs steps 2–4 in order, writes each PNG locally, and does not edit the file.
+After artboard discovery, `figma_prepare_review` is the faster equivalent for one to eight known artboards. One packaged plugin operation reads their copy and optionally audits overflow; the server then writes each PNG locally. It does not leave edits in the file. For two artboards with overflow audits, this uses three plugin commands instead of five.
 
 This avoids guessed node IDs, partial-copy edits, and layout changes made without visual evidence.
 
@@ -202,7 +202,7 @@ The bridge keeps its command surface intentionally narrow. It exposes the follow
 - `figma_create_section` — create a native reference-board/artboard section with collision rejection by default.
 - `figma_audit_text_overflow` — bounds and natural-size checks with actionable overflow and clipping warnings.
 - `figma_export_frame_png` — write a PNG to `~/Pictures/Figma MCP Exports` and return only its absolute path and dimensions.
-- `figma_prepare_review` — read one to eight ordered artboards, export them locally, and optionally audit their text in one non-mutating call.
+- `figma_prepare_review` — read and optionally audit one to eight ordered artboards in one packaged plugin operation, then export them locally in the same MCP call.
 - `figma_archive_nodes` / `figma_supersede_layout` — hide explicit prior siblings in a named reversible group and record the replacement relationship.
 - `figma_compose_frame` — atomically create a native frame in the page or a section, with root auto-layout, panels/dividers and styled-span text; reject accidental overlap and empty/incomplete results.
 - `figma_copy_style_from_node` / `figma_list_page_tokens` — inherit verified on-brand styling and discover local variables/styles plus page usage.

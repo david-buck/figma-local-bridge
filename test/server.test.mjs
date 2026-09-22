@@ -160,7 +160,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     capabilities: {},
     clientInfo: { name: "figma-bridge-test", version: "1.0.0" },
   });
-  assert.equal(initialized.serverInfo.version, "0.13.0");
+  assert.equal(initialized.serverInfo.version, "0.13.1");
   assert.match(initialized.instructions, /figma_prepare_review/);
   assert.match(initialized.instructions, /figma_apply_copy_updates/);
   rpc.notify("notifications/initialized");
@@ -295,7 +295,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     capabilities: {},
     clientInfo: { name: "figma-bridge-proxy-test", version: "1.0.0" },
   });
-  assert.equal(proxyInitialized.serverInfo.version, "0.13.0");
+  assert.equal(proxyInitialized.serverInfo.version, "0.13.1");
   proxyRpc.notify("notifications/initialized");
   const proxyStatus = toolJson(await proxyRpc.request("tools/call", { name: "figma_bridge_status", arguments: {} }));
   assert.equal(proxyStatus.connected, true);
@@ -400,19 +400,21 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
 
   const commandNames = [];
   const fakePlugin = (async () => {
-    for (let handled = 0; handled < 5;) {
+    for (let handled = 0; handled < 3;) {
       const response = await fetch(`${baseUrl}/v1/poll?sessionId=${sessionId}&pageId=0%3A1&pageName=Campaign&selectionCount=0`);
       if (response.status === 204) continue;
       assert.equal(response.status, 200);
       const { command } = await response.json();
       commandNames.push(command.name);
       let result;
-      if (command.name === "readSpreadContent") {
-        result = { page: { id: "0:1", name: "Campaign" }, frameCount: 2, frames: [], copy: "Left\n\nRight" };
+      if (command.name === "prepareReviewData") {
+        assert.deepEqual(command.input, { nodeIds: ["1:1", "1:2"], detail: "summary", auditOverflow: true });
+        result = {
+          content: { page: { id: "0:1", name: "Campaign" }, frameCount: 2, frames: [], copy: "Left\n\nRight" },
+          overflowAudits: ["1:1", "1:2"].map((id) => ({ frame: { id }, textCount: 0, warningCount: 0, text: [] })),
+        };
       } else if (command.name === "exportFramePng") {
         result = { imageBase64: onePixelPng, mimeType: "image/png", nodeId: command.input.nodeId, nodeName: `Frame ${command.input.nodeId}`, width: 1, height: 1 };
-      } else if (command.name === "auditTextOverflow") {
-        result = { frame: { id: command.input.nodeId }, textCount: 0, warningCount: 0, text: [] };
       } else {
         throw new Error(`Unexpected command ${command.name}`);
       }
@@ -427,7 +429,8 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     arguments: { nodeIds: ["1:1", "1:2"], auditOverflow: true, maxDimension: 1_024, scale: 1 },
   }));
   await fakePlugin;
-  assert.deepEqual(commandNames, ["readSpreadContent", "exportFramePng", "exportFramePng", "auditTextOverflow", "auditTextOverflow"]);
+  assert.deepEqual(commandNames, ["prepareReviewData", "exportFramePng", "exportFramePng"]);
+  assert.equal(prepared.content.copy, "Left\n\nRight");
   assert.equal(prepared.exports.length, 2);
   assert.equal(prepared.overflowAudits.length, 2);
   for (const exported of prepared.exports) {

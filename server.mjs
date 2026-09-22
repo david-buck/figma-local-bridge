@@ -14,7 +14,7 @@ const launchParentPid = process.ppid;
 const sessionFreshnessMs = 35_000;
 const replacedSessionRetentionMs = 5 * 60_000;
 const proxyHealthIntervalMs = 2_000;
-const bridgeVersion = "0.13.0";
+const bridgeVersion = "0.13.1";
 const exportDirectory = process.env.FIGMA_EXPORT_DIR ?? join(homedir(), "Pictures", "Figma MCP Exports");
 const preferencesDirectory = process.env.FIGMA_PREFERENCES_DIR ?? join(homedir(), ".figma-local-bridge");
 const preferencesPath = join(preferencesDirectory, "preferences.json");
@@ -1474,7 +1474,7 @@ server.registerTool("figma_export_frame_png", {
 
 server.registerTool("figma_prepare_review", {
   title: "Prepare Figma artboards for review",
-  description: "After figma_list_artboards, prepare one artboard or an ordered spread for copy/layout review in one call. Reads structured copy first, writes each artboard to a local PNG, then optionally audits text overflow. It never edits the document.",
+  description: "After figma_list_artboards, prepare one artboard or an ordered spread for copy/layout review in one call. Reads structured copy and optionally audits text overflow in one plugin operation, then writes each artboard to a local PNG. It never leaves document edits.",
   inputSchema: {
     nodeIds: z.array(nodeId).min(1).max(8).describe("One to eight artboard IDs in the exact review/spread order returned by figma_list_artboards."),
     auditOverflow: z.boolean().default(true),
@@ -1484,9 +1484,11 @@ server.registerTool("figma_prepare_review", {
   },
 }, async (input) => {
   try {
-    const content = input.nodeIds.length === 1
-      ? await sendCommand("readFrameContent", { nodeId: input.nodeIds[0], detail: input.detail, includeHidden: false })
-      : await sendCommand("readSpreadContent", { nodeIds: input.nodeIds, detail: input.detail, includeHidden: false });
+    const { content, overflowAudits } = await sendCommand("prepareReviewData", {
+      nodeIds: input.nodeIds,
+      detail: input.detail,
+      auditOverflow: input.auditOverflow,
+    }, input.auditOverflow ? Math.min(600_000, 120_000 * input.nodeIds.length) : 30_000);
     const exports = [];
     for (const reviewNodeId of input.nodeIds) {
       exports.push(await writePngExport(await sendCommand("exportFramePng", {
@@ -1494,12 +1496,6 @@ server.registerTool("figma_prepare_review", {
         maxDimension: input.maxDimension,
         scale: input.scale,
       }, 120_000)));
-    }
-    const overflowAudits = [];
-    if (input.auditOverflow) {
-      for (const reviewNodeId of input.nodeIds) {
-        overflowAudits.push(await sendCommand("auditTextOverflow", { nodeId: reviewNodeId, detail: input.detail, includeHidden: false }, 120_000));
-      }
     }
     return output({
       nodeIds: input.nodeIds,

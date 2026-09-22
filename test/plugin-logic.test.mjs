@@ -46,6 +46,31 @@ test("plugin activity distinguishes document writes from reads", async () => {
   const read = activityForCommand("readFrameContent");
   assert.equal(read.mutating, false);
   assert.equal(read.label, "Read frame content");
+  assert.equal(activityForCommand("prepareReviewData").mutating, false);
+});
+
+test("packaged review read preserves frame order and audit shape", async () => {
+  const { execute, figma } = await loadPluginHelpers();
+  const frames = ["Left", "Right"].map((name, index) => ({
+    id: `1:${index + 1}`,
+    name,
+    type: "FRAME",
+    children: [],
+    absoluteBoundingBox: { x: index * 200, y: 0, width: 180, height: 100 },
+    findAllWithCriteria() { return []; },
+  }));
+  configurePage(figma, frames);
+  const input = { nodeIds: frames.map((frame) => frame.id), detail: "summary", auditOverflow: true };
+  const result = await execute("prepareReviewData", input);
+  assert.deepEqual(Array.from(result.content.frames, (frame) => frame.frame.id), input.nodeIds);
+  assert.deepEqual(Array.from(result.overflowAudits, (audit) => audit.frame.id), input.nodeIds);
+  assert.equal(result.content.frameCount, 2);
+  assert.equal(result.overflowAudits.every((audit) => audit.warningCount === 0), true);
+
+  const single = await execute("prepareReviewData", { nodeIds: [frames[0].id], detail: "full", auditOverflow: false });
+  assert.equal(single.content.frame.id, frames[0].id);
+  assert.equal(single.content.frames, undefined);
+  assert.equal(single.overflowAudits.length, 0);
 });
 
 function styledText(id, characters, parent) {

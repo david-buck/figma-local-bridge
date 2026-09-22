@@ -2,7 +2,7 @@ figma.showUI(__html__, { width: 380, height: 250, title: "Local MCP Bridge" });
 
 let bridgeGeneration = 0;
 const bridgeUrl = "http://localhost:3846";
-const pluginVersion = "0.13.0";
+const pluginVersion = "0.13.1";
 const bridgeClientId = `figma-client-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const mutatingCommands = new Set([
   "moveResizeReparent", "updateText", "setTextCase", "deleteNode", "duplicateNode",
@@ -1570,6 +1570,26 @@ async function execute(name, input) {
       copy: frames.map((frame) => frame.copy).join("\n\n"),
       ...(input.detail === "full" ? { allCopy: frames.map((frame) => frame.allCopy).join("\n\n") } : {}),
     };
+  }
+
+  if (name === "prepareReviewData") {
+    const roots = input.nodeIds.map((id) => sceneNode(id));
+    const frames = roots.map((root) => input.detail === "full" ? textContent(root) : compactCopy(root, false));
+    const content = roots.length === 1 ? frames[0] : {
+      page: { id: figma.currentPage.id, name: figma.currentPage.name },
+      frameCount: frames.length,
+      frames,
+      copy: frames.map((frame) => frame.copy).join("\n\n"),
+      ...(input.detail === "full" ? { allCopy: frames.map((frame) => frame.allCopy).join("\n\n") } : {}),
+    };
+    const overflowAudits = [];
+    if (input.auditOverflow) {
+      for (const root of roots) {
+        const audit = await auditTextOverflow(root, { includeHidden: false });
+        overflowAudits.push(input.detail === "full" ? audit : auditSummary(audit));
+      }
+    }
+    return { content, overflowAudits };
   }
 
   if (name === "auditTextOverflow") {

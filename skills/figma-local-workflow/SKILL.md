@@ -27,7 +27,7 @@ Use an inspect-first sequence. Do not begin by querying arbitrary page nodes or 
 
 ## Fast review path
 
-After artboard discovery, use `figma_prepare_review` only for a visual page/spread review. It performs the read, local PNG exports, and optional overflow audits in that order without editing. For copy reconciliation, prefer `figma_read_copy` and overflow auditing so routine work does not consume image tokens.
+After artboard discovery, use `figma_prepare_review` only for a visual page/spread review. It reads the copy and optionally audits overflow in one plugin operation, then writes the PNG exports locally without leaving document edits. For copy reconciliation, prefer `figma_read_copy` and overflow auditing so routine work does not consume image tokens.
 
 ## Review comments
 
