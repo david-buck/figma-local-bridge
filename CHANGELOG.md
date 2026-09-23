@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.13.2 — 2026-09-23
+
+- Added a matching icon to the Codex plugin listing, composer, README, and Figma plugin status panel. The vector master and square PNG exports are in `assets/`.
+- Aligned the Codex and Claude package versions with the bridge and Figma plugin. Canvas commands and MCP tool behavior are unchanged.
+
 ## 0.13.1 — 2026-09-23
 
 - `figma_prepare_review` now reads ordered copy and runs optional overflow audits in one packaged plugin command, then exports one PNG per artboard. With two artboards and audits, the plugin handles three commands instead of five.

@@ -1,5 +1,7 @@
 # Local Figma MCP bridge
 
+<img src="assets/composer-icon.png" alt="Figma Local Bridge icon" width="64" height="64">
+
 Use MCP tools to inspect and edit the Figma Design file open in Figma Desktop. A local Figma plugin performs canvas operations through the Plugin API; the MCP server relays named, validated commands to it. Canvas work needs no Figma API token. Comments are optional and use Figma's REST API.
 
 The bridge can read artboards and copy, inspect layout and design-system assets, audit text fit, export PNGs, and make controlled edits to native Figma nodes. It connects to one open Figma file at a time and never runs JavaScript supplied by an agent. See the [tool and workflow reference](docs/reference.md) for the full list.
