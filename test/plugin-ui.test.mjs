@@ -4,6 +4,13 @@ import test from "node:test";
 
 const ui = await readFile(new URL("../plugin/ui.html", import.meta.url), "utf8");
 
+test("Figma status panel embeds the exact plugin icon", async () => {
+  const icon = await readFile(new URL("../assets/icon.png", import.meta.url));
+  const dataUri = ui.match(/<img src="data:image\/png;base64,([A-Za-z0-9+/=]+)" alt="">/);
+  assert.ok(dataUri, "status panel should embed a PNG icon");
+  assert.deepEqual(Buffer.from(dataUri[1], "base64"), icon);
+});
+
 test("plugin API setup uses a transient password field and all credential routes", () => {
   assert.match(ui, /type="password"/);
   assert.match(ui, /api-credentials\/status/);

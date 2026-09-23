@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.13.3 — 2026-09-23
+
+- Replaced the temporary mark with the supplied icon in the Codex plugin listing, composer, README, and Figma plugin status panel. All placements use the same unmodified PNG.
+- Canvas commands and MCP tool behavior are unchanged.
+
 ## 0.13.2 — 2026-09-23
 
 - Added a matching icon to the Codex plugin listing, composer, README, and Figma plugin status panel. The vector master and square PNG exports are in `assets/`.
