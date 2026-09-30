@@ -1,7 +1,10 @@
 import http from "node:http";
+import https from "node:https";
+import { lookup } from "node:dns/promises";
 import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { isIP } from "node:net";
 import { isAbsolute, join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -14,7 +17,7 @@ const launchParentPid = process.ppid;
 const sessionFreshnessMs = 35_000;
 const replacedSessionRetentionMs = 5 * 60_000;
 const proxyHealthIntervalMs = 2_000;
-const bridgeVersion = "0.13.3";
+const bridgeVersion = "0.13.4";
 const exportDirectory = process.env.FIGMA_EXPORT_DIR ?? join(homedir(), "Pictures", "Figma MCP Exports");
 const preferencesDirectory = process.env.FIGMA_PREFERENCES_DIR ?? join(homedir(), ".figma-local-bridge");
 const preferencesPath = join(preferencesDirectory, "preferences.json");
@@ -547,15 +550,129 @@ function imageMimeType(bytes) {
   return null;
 }
 
+const maxImageBytes = 25 * 1024 * 1024;
+
+function ipv4Number(address) {
+  if (isIP(address) !== 4) return null;
+  return address.split(".").reduce((value, octet) => ((value << 8) | Number(octet)) >>> 0, 0);
+}
+
+function isPublicAddress(address) {
+  const family = isIP(address);
+  if (family === 4) {
+    const value = ipv4Number(address);
+    const inSubnet = (subnet, prefix) => {
+      const base = ipv4Number(subnet);
+      const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+      return (value & mask) === (base & mask);
+    };
+    const nonPublic = [
+      ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8],
+      ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.0.2.0", 24],
+      ["192.88.99.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15], ["198.51.100.0", 24],
+      ["203.0.113.0", 24], ["224.0.0.0", 4], ["240.0.0.0", 4],
+    ];
+    return !nonPublic.some(([subnet, prefix]) => inSubnet(subnet, prefix));
+  }
+  if (family === 6) {
+    const normalized = address.toLowerCase();
+    // Only global unicast 2000::/3 is allowed. This excludes loopback,
+    // link-local, unique-local, multicast, and IPv4-mapped addresses.
+    if (!/^2[0-9a-f]{3}:/i.test(normalized)) return false;
+    if (normalized.startsWith("2001:db8:") || normalized.startsWith("2001:10:") || normalized.startsWith("2001:20:")) return false;
+    return true;
+  }
+  return false;
+}
+
+async function requestRemoteImage(url, address) {
+  return new Promise((resolve, reject) => {
+    const request = https.request(url, {
+      method: "GET",
+      headers: {
+        accept: "image/png,image/jpeg,image/gif,image/webp",
+        "user-agent": "Figma Local Bridge",
+      },
+      lookup: (_hostname, options, callback) => options?.all
+        ? callback(null, [address])
+        : callback(null, address.address, address.family),
+      servername: url.hostname,
+    }, (response) => {
+      const status = response.statusCode ?? 0;
+      if ([301, 302, 303, 307, 308].includes(status)) {
+        const location = response.headers.location;
+        response.resume();
+        resolve({ redirect: location });
+        return;
+      }
+      if (status !== 200) {
+        response.resume();
+        reject(new Error(`Image URL returned HTTP ${status}.`));
+        return;
+      }
+      const declaredLength = Number(response.headers["content-length"]);
+      if (Number.isFinite(declaredLength) && declaredLength > maxImageBytes) {
+        response.resume();
+        reject(new Error("Remote image exceeds the 25 MB safety limit."));
+        return;
+      }
+      const chunks = [];
+      let size = 0;
+      response.on("data", (chunk) => {
+        size += chunk.length;
+        if (size > maxImageBytes) {
+          response.destroy(new Error("Remote image exceeds the 25 MB safety limit."));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.on("end", () => resolve({ bytes: Buffer.concat(chunks) }));
+      response.on("error", reject);
+    });
+    request.setTimeout(15_000, () => request.destroy(new Error("Remote image request timed out.")));
+    request.on("error", reject);
+    request.end();
+  });
+}
+
+async function readRemoteImage(inputUrl) {
+  let url;
+  try { url = new URL(inputUrl); } catch { throw new Error("Image URL must be a valid HTTPS URL."); }
+  for (let redirects = 0; redirects <= 5; redirects += 1) {
+    if (url.protocol !== "https:" || url.username || url.password) throw new Error("Image URL must use HTTPS and must not include embedded credentials.");
+    const addresses = await lookup(url.hostname, { all: true, verbatim: true });
+    if (!addresses.length || addresses.some(({ address }) => !isPublicAddress(address))) {
+      throw new Error("Image URL must resolve only to public IP addresses.");
+    }
+    const response = await requestRemoteImage(url, addresses[0]);
+    if (response.bytes) return { bytes: response.bytes, sourceUrl: `${url.origin}${url.pathname}` };
+    if (!response.redirect || redirects === 5) throw new Error("Image URL redirected too many times or omitted its destination.");
+    url = new URL(response.redirect, url);
+  }
+  throw new Error("Image URL redirected too many times.");
+}
+
 async function localImageInput(input) {
-  if (!isAbsolute(input.path)) throw new Error("Local image path must be absolute.");
-  const bytes = await readFile(input.path);
-  if (bytes.length === 0) throw new Error("The approved local image is empty.");
-  if (bytes.length > 25 * 1024 * 1024) throw new Error("The approved local image exceeds the 25 MB safety limit.");
+  const hasPath = typeof input.path === "string" && input.path.trim().length > 0;
+  const hasUrl = typeof input.url === "string" && input.url.trim().length > 0;
+  if (hasPath === hasUrl) throw new Error("Provide exactly one absolute local path or HTTPS image URL.");
+  let bytes;
+  let sourcePath;
+  if (hasPath) {
+    if (!isAbsolute(input.path)) throw new Error("Local image path must be absolute.");
+    bytes = await readFile(input.path);
+    sourcePath = input.path;
+    if (bytes.length > maxImageBytes) throw new Error("The approved local image exceeds the 25 MB safety limit.");
+  } else {
+    const remote = await readRemoteImage(input.url.trim());
+    bytes = remote.bytes;
+    sourcePath = remote.sourceUrl;
+  }
+  if (bytes.length === 0) throw new Error("The approved image is empty.");
   const mimeType = imageMimeType(bytes);
-  if (!mimeType) throw new Error("Local image must be a valid PNG, JPEG, GIF, or WebP file.");
-  const { path, ...rest } = input;
-  return { ...rest, sourcePath: path, mimeType, imageBase64: bytes.toString("base64") };
+  if (!mimeType) throw new Error("Image must be a valid PNG, JPEG, GIF, or WebP file.");
+  const { path, url, ...rest } = input;
+  return { ...rest, sourcePath, mimeType, imageBase64: bytes.toString("base64") };
 }
 
 async function localizeBatchExports(data) {
@@ -1735,9 +1852,11 @@ server.registerTool("figma_copy_image_fill", {
 
 server.registerTool("figma_place_local_image", {
   title: "Place an approved local image in Figma",
-  description: "Read an explicitly approved absolute local PNG/JPEG/GIF/WebP path (maximum 25 MB), create an image-filled rectangle in the current Figma page or parent, and return its node ID. No network fetch is performed.",
+  description: "Place an explicitly approved PNG/JPEG/GIF/WebP image from one absolute local path or HTTPS URL (maximum 25 MB) as an image-filled rectangle in the current Figma page or parent. URL fetches are restricted to public IPs and revalidated across redirects.",
   inputSchema: {
-    path: z.string().trim().min(1).max(4_096), name: z.string().trim().min(1).max(200), width: z.number().finite().min(1).max(10_000), height: z.number().finite().min(1).max(10_000),
+    path: z.string().trim().min(1).max(4_096).optional(),
+    url: z.string().trim().min(1).max(8_192).optional().describe("HTTPS URL to an image. Only public IP destinations are fetched, with redirects revalidated."),
+    name: z.string().trim().min(1).max(200), width: z.number().finite().min(1).max(10_000), height: z.number().finite().min(1).max(10_000),
     ...position, parentId: nodeId.optional(), scaleMode: z.enum(["FILL", "FIT", "CROP", "TILE"]).default("FILL"), imageTransform: imageTransform.optional(), cornerRadius: z.number().finite().min(0).max(10_000).optional(), opacity: opacity.optional(),
   },
 }, async (input) => {

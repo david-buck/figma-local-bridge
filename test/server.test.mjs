@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
@@ -9,6 +10,94 @@ import test from "node:test";
 import vm from "node:vm";
 
 const onePixelPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+async function imageHarness(overrides = {}) {
+  const source = await readFile(new URL("../server.mjs", import.meta.url), "utf8");
+  const sandbox = {
+    Buffer, URL, isIP: net.isIP,
+    isAbsolute: (path) => path.startsWith("/"),
+    readFile: async () => Buffer.from(onePixelPng, "base64"),
+    lookup: async () => [{ address: "93.184.216.34", family: 4 }],
+    ...overrides,
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(source.slice(source.indexOf("function imageMimeType("), source.indexOf("async function localizeBatchExports(")), sandbox);
+  return sandbox;
+}
+
+test("image input validates one approved source and preserves local image bytes", async () => {
+  const harness = await imageHarness();
+  await assert.rejects(harness.localImageInput({}), /exactly one/);
+  await assert.rejects(harness.localImageInput({ path: "/image.png", url: "https://example.com/image.png" }), /exactly one/);
+  await assert.rejects(harness.localImageInput({ path: "image.png" }), /absolute/);
+  await assert.rejects(harness.localImageInput({ url: "http://example.com/image.png" }), /HTTPS/);
+  await assert.rejects(harness.localImageInput({ url: "https://user:password@example.com/image.png" }), /embedded credentials/);
+  const image = await harness.localImageInput({ path: "/image.png", name: "Approved" });
+  assert.equal(image.imageBase64, onePixelPng);
+  assert.equal(image.sourcePath, "/image.png");
+  assert.equal(image.path, undefined);
+});
+
+test("remote image validation rejects mixed public/private DNS and rechecks redirects", async () => {
+  let requests = 0;
+  const harness = await imageHarness({ lookup: async () => [
+    { address: "93.184.216.34", family: 4 }, { address: "127.0.0.1", family: 4 },
+  ] });
+  harness.requestRemoteImage = async () => { requests += 1; return { redirect: "https://private.example/image.png" }; };
+  await assert.rejects(harness.readRemoteImage("https://example.com/image.png"), /public IP/);
+  assert.equal(requests, 0);
+  harness.lookup = async (hostname) => [{ address: hostname === "private.example" ? "10.0.0.1" : "93.184.216.34", family: 4 }];
+  await assert.rejects(harness.readRemoteImage("https://example.com/image.png"), /public IP/);
+  assert.equal(requests, 1);
+});
+
+test("remote images redact URL queries, validate image bytes, and bound redirects", async () => {
+  const harness = await imageHarness();
+  harness.requestRemoteImage = async () => ({ bytes: Buffer.from(onePixelPng, "base64") });
+  const image = await harness.localImageInput({ url: "https://example.com/image.png?token=private#fragment" });
+  assert.equal(image.sourcePath, "https://example.com/image.png");
+  assert.equal(image.imageBase64, onePixelPng);
+  assert.equal(image.url, undefined);
+  harness.requestRemoteImage = async () => ({ bytes: Buffer.from("not an image") });
+  await assert.rejects(harness.localImageInput({ url: "https://example.com/image.png" }), /valid PNG/);
+  let requests = 0;
+  harness.requestRemoteImage = async () => { requests += 1; return { redirect: "/again" }; };
+  await assert.rejects(harness.readRemoteImage("https://example.com/image.png"), /too many/);
+  assert.equal(requests, 6);
+});
+
+test("HTTPS image transport pins validated DNS in both Node lookup modes and rejects oversized responses", async () => {
+  const address = { address: "93.184.216.34", family: 4 };
+  let declaredLength = Buffer.from(onePixelPng, "base64").length;
+  const harness = await imageHarness({ https: { request(_url, options, respond) {
+    options.lookup("example.com", { all: true }, (error, addresses) => {
+      assert.equal(error, null);
+      assert.equal(addresses.length, 1);
+      assert.equal(addresses[0].address, address.address);
+    });
+    options.lookup("example.com", {}, (error, ip, family) => {
+      assert.equal(error, null);
+      assert.equal(ip, address.address);
+      assert.equal(family, address.family);
+    });
+    const request = new EventEmitter();
+    request.setTimeout = () => {};
+    request.end = () => {
+      const response = new EventEmitter();
+      response.statusCode = 200;
+      response.headers = { "content-length": String(declaredLength) };
+      response.resume = () => {};
+      respond(response);
+      response.emit("data", Buffer.from(onePixelPng, "base64"));
+      response.emit("end");
+    };
+    return request;
+  } } });
+  const result = await harness.requestRemoteImage(new URL("https://example.com/image.png"), address);
+  assert.equal(result.bytes.toString("base64"), onePixelPng);
+  declaredLength = 26 * 1024 * 1024;
+  await assert.rejects(harness.requestRemoteImage(new URL("https://example.com/image.png"), address), /25 MB/);
+});
 
 async function freePort() {
   return new Promise((resolve, reject) => {
@@ -160,7 +249,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     capabilities: {},
     clientInfo: { name: "figma-bridge-test", version: "1.0.0" },
   });
-  assert.equal(initialized.serverInfo.version, "0.13.3");
+  assert.equal(initialized.serverInfo.version, "0.13.4");
   assert.match(initialized.instructions, /figma_prepare_review/);
   assert.match(initialized.instructions, /figma_apply_copy_updates/);
   rpc.notify("notifications/initialized");
@@ -295,7 +384,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     capabilities: {},
     clientInfo: { name: "figma-bridge-proxy-test", version: "1.0.0" },
   });
-  assert.equal(proxyInitialized.serverInfo.version, "0.13.3");
+  assert.equal(proxyInitialized.serverInfo.version, "0.13.4");
   proxyRpc.notify("notifications/initialized");
   const proxyStatus = toolJson(await proxyRpc.request("tools/call", { name: "figma_bridge_status", arguments: {} }));
   assert.equal(proxyStatus.connected, true);

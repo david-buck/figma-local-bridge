@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.13.4 — 2026-09-30
+
+- `figma_place_local_image` now accepts an approved HTTPS image URL as well as an absolute local image path. Provide exactly one source; PNG, JPEG, GIF, and WebP remain supported.
+- URL downloads are capped at 25 MB, reject embedded credentials and non-public destinations, and recheck each destination across up to five redirects. The bridge checks image signatures before sending bytes to Figma and omits URL query strings from returned source metadata.
+- Added offline checks for source validation, DNS and redirect restrictions, image signatures, transfer limits, and Node's DNS lookup callback modes.
+- Updated the tool reference and workflow guidance for approved URL images. Reload the MCP server and Figma development plugin after updating.
+
 ## 0.13.3 — 2026-09-23
 
 - Replaced the temporary mark with the supplied icon in the Codex plugin listing, composer, README, and Figma plugin status panel. All placements use the same unmodified PNG.

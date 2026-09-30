@@ -71,7 +71,7 @@ The bridge keeps its command surface intentionally narrow. It exposes the follow
 - `figma_create_component_instance` / `figma_apply_design_style` — create a linked instance or apply a named local/library style by verified ID or key.
 - `figma_get_user_preferences` / `figma_set_user_preference` / `figma_delete_user_preference` / `figma_revert_user_preferences` — manage explicit, revision-guarded per-user design-system guidance.
 - `figma_resolve_design_choice` — score candidates against confirmed scoped preferences and require clarification rather than guessing when they tie.
-- `figma_copy_image_fill` / `figma_place_local_image` — reuse/crop an existing Figma image or place an explicitly approved local raster image.
+- `figma_copy_image_fill` / `figma_place_local_image` — reuse/crop an existing Figma image or place an explicitly approved local raster image. `figma_place_local_image` accepts exactly one absolute local path or HTTPS URL, caps transfers at 25 MB, follows at most five redirects, validates every destination as public, and checks image bytes before importing.
 - `figma_comment_status` / `figma_list_comments` — check optional REST setup and read file comments, with resolved comments excluded by default.
 - `figma_post_comment` — post a canvas- or frame-pinned comment, or reply to an existing comment.
 - `figma_delete_comment` — permanently delete one identified comment behind an explicit confirmation guard.

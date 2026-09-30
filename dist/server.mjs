@@ -3306,8 +3306,8 @@ var require_utils = __commonJS({
     var HOST_DELIMS = { "@": "%40", "/": "%2F", "?": "%3F", "#": "%23", ":": "%3A" };
     var HOST_DELIM_RE = /[@/?#:]/g;
     var HOST_DELIM_NO_COLON_RE = /[@/?#]/g;
-    function reescapeHostDelimiters(host2, isIP) {
-      const re = isIP ? HOST_DELIM_NO_COLON_RE : HOST_DELIM_RE;
+    function reescapeHostDelimiters(host2, isIP2) {
+      const re = isIP2 ? HOST_DELIM_NO_COLON_RE : HOST_DELIM_RE;
       re.lastIndex = 0;
       return host2.replace(re, (ch) => HOST_DELIMS[ch]);
     }
@@ -3550,7 +3550,7 @@ var require_schemes = __commonJS({
         serialize: httpSerialize
       }
     );
-    var https = (
+    var https2 = (
       /** @type {SchemeHandler} */
       {
         scheme: "https",
@@ -3599,7 +3599,7 @@ var require_schemes = __commonJS({
       /** @type {Record<SchemeName, SchemeHandler>} */
       {
         http: http2,
-        https,
+        https: https2,
         ws,
         wss,
         urn,
@@ -3796,7 +3796,7 @@ var require_fast_uri = __commonJS({
         fragment: void 0
       };
       let malformedAuthorityOrPort = false;
-      let isIP = false;
+      let isIP2 = false;
       if (options.reference === "suffix") {
         if (options.scheme) {
           uri = options.scheme + ":" + uri;
@@ -3845,9 +3845,9 @@ var require_fast_uri = __commonJS({
           if (ipv4result === false) {
             const ipv6result = normalizeIPv6(parsed.host);
             parsed.host = ipv6result.host.toLowerCase();
-            isIP = ipv6result.isIPV6;
+            isIP2 = ipv6result.isIPV6;
           } else {
-            isIP = true;
+            isIP2 = true;
           }
         }
         if (parsed.scheme === void 0 && parsed.userinfo === void 0 && parsed.host === void 0 && parsed.port === void 0 && parsed.query === void 0 && !parsed.path) {
@@ -3864,7 +3864,7 @@ var require_fast_uri = __commonJS({
         }
         const schemeHandler = getSchemeHandler(options.scheme || parsed.scheme);
         if (!options.unicodeSupport && (!schemeHandler || !schemeHandler.unicodeSupport)) {
-          if (parsed.host && (options.domainHost || schemeHandler && schemeHandler.domainHost) && isIP === false && nonSimpleDomain(parsed.host)) {
+          if (parsed.host && (options.domainHost || schemeHandler && schemeHandler.domainHost) && isIP2 === false && nonSimpleDomain(parsed.host)) {
             try {
               parsed.host = new URL("http://" + parsed.host).hostname;
             } catch (e) {
@@ -3878,7 +3878,7 @@ var require_fast_uri = __commonJS({
               parsed.scheme = unescape(parsed.scheme);
             }
             if (parsed.host !== void 0) {
-              parsed.host = reescapeHostDelimiters(unescape(parsed.host), isIP);
+              parsed.host = reescapeHostDelimiters(unescape(parsed.host), isIP2);
             }
           }
           if (parsed.path) {
@@ -6916,9 +6916,12 @@ var require_dist = __commonJS({
 
 // server.mjs
 import http from "node:http";
+import https from "node:https";
+import { lookup } from "node:dns/promises";
 import { randomUUID } from "node:crypto";
 import { mkdir as mkdir2, open, readFile as readFile2, rename as rename2, stat, unlink as unlink2, writeFile as writeFile2 } from "node:fs/promises";
 import { homedir } from "node:os";
+import { isIP } from "node:net";
 import { isAbsolute, join as join2 } from "node:path";
 
 // node_modules/zod/v3/helpers/util.js
@@ -31236,7 +31239,7 @@ var launchParentPid = process.ppid;
 var sessionFreshnessMs = 35e3;
 var replacedSessionRetentionMs = 5 * 6e4;
 var proxyHealthIntervalMs = 2e3;
-var bridgeVersion = "0.13.3";
+var bridgeVersion = "0.13.4";
 var exportDirectory = process.env.FIGMA_EXPORT_DIR ?? join2(homedir(), "Pictures", "Figma MCP Exports");
 var preferencesDirectory = process.env.FIGMA_PREFERENCES_DIR ?? join2(homedir(), ".figma-local-bridge");
 var preferencesPath = join2(preferencesDirectory, "preferences.json");
@@ -31719,15 +31722,135 @@ function imageMimeType(bytes) {
   if (bytes.length >= 12 && bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
   return null;
 }
+var maxImageBytes = 25 * 1024 * 1024;
+function ipv4Number(address) {
+  if (isIP(address) !== 4) return null;
+  return address.split(".").reduce((value, octet) => (value << 8 | Number(octet)) >>> 0, 0);
+}
+function isPublicAddress(address) {
+  const family = isIP(address);
+  if (family === 4) {
+    const value = ipv4Number(address);
+    const inSubnet = (subnet, prefix) => {
+      const base = ipv4Number(subnet);
+      const mask = prefix === 0 ? 0 : 4294967295 << 32 - prefix >>> 0;
+      return (value & mask) === (base & mask);
+    };
+    const nonPublic = [
+      ["0.0.0.0", 8],
+      ["10.0.0.0", 8],
+      ["100.64.0.0", 10],
+      ["127.0.0.0", 8],
+      ["169.254.0.0", 16],
+      ["172.16.0.0", 12],
+      ["192.0.0.0", 24],
+      ["192.0.2.0", 24],
+      ["192.88.99.0", 24],
+      ["192.168.0.0", 16],
+      ["198.18.0.0", 15],
+      ["198.51.100.0", 24],
+      ["203.0.113.0", 24],
+      ["224.0.0.0", 4],
+      ["240.0.0.0", 4]
+    ];
+    return !nonPublic.some(([subnet, prefix]) => inSubnet(subnet, prefix));
+  }
+  if (family === 6) {
+    const normalized = address.toLowerCase();
+    if (!/^2[0-9a-f]{3}:/i.test(normalized)) return false;
+    if (normalized.startsWith("2001:db8:") || normalized.startsWith("2001:10:") || normalized.startsWith("2001:20:")) return false;
+    return true;
+  }
+  return false;
+}
+async function requestRemoteImage(url2, address) {
+  return new Promise((resolve, reject) => {
+    const request = https.request(url2, {
+      method: "GET",
+      headers: {
+        accept: "image/png,image/jpeg,image/gif,image/webp",
+        "user-agent": "Figma Local Bridge"
+      },
+      lookup: (_hostname, options, callback) => options?.all ? callback(null, [address]) : callback(null, address.address, address.family),
+      servername: url2.hostname
+    }, (response) => {
+      const status = response.statusCode ?? 0;
+      if ([301, 302, 303, 307, 308].includes(status)) {
+        const location = response.headers.location;
+        response.resume();
+        resolve({ redirect: location });
+        return;
+      }
+      if (status !== 200) {
+        response.resume();
+        reject(new Error(`Image URL returned HTTP ${status}.`));
+        return;
+      }
+      const declaredLength = Number(response.headers["content-length"]);
+      if (Number.isFinite(declaredLength) && declaredLength > maxImageBytes) {
+        response.resume();
+        reject(new Error("Remote image exceeds the 25 MB safety limit."));
+        return;
+      }
+      const chunks = [];
+      let size = 0;
+      response.on("data", (chunk) => {
+        size += chunk.length;
+        if (size > maxImageBytes) {
+          response.destroy(new Error("Remote image exceeds the 25 MB safety limit."));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.on("end", () => resolve({ bytes: Buffer.concat(chunks) }));
+      response.on("error", reject);
+    });
+    request.setTimeout(15e3, () => request.destroy(new Error("Remote image request timed out.")));
+    request.on("error", reject);
+    request.end();
+  });
+}
+async function readRemoteImage(inputUrl) {
+  let url2;
+  try {
+    url2 = new URL(inputUrl);
+  } catch {
+    throw new Error("Image URL must be a valid HTTPS URL.");
+  }
+  for (let redirects = 0; redirects <= 5; redirects += 1) {
+    if (url2.protocol !== "https:" || url2.username || url2.password) throw new Error("Image URL must use HTTPS and must not include embedded credentials.");
+    const addresses = await lookup(url2.hostname, { all: true, verbatim: true });
+    if (!addresses.length || addresses.some(({ address }) => !isPublicAddress(address))) {
+      throw new Error("Image URL must resolve only to public IP addresses.");
+    }
+    const response = await requestRemoteImage(url2, addresses[0]);
+    if (response.bytes) return { bytes: response.bytes, sourceUrl: `${url2.origin}${url2.pathname}` };
+    if (!response.redirect || redirects === 5) throw new Error("Image URL redirected too many times or omitted its destination.");
+    url2 = new URL(response.redirect, url2);
+  }
+  throw new Error("Image URL redirected too many times.");
+}
 async function localImageInput(input) {
-  if (!isAbsolute(input.path)) throw new Error("Local image path must be absolute.");
-  const bytes = await readFile2(input.path);
-  if (bytes.length === 0) throw new Error("The approved local image is empty.");
-  if (bytes.length > 25 * 1024 * 1024) throw new Error("The approved local image exceeds the 25 MB safety limit.");
+  const hasPath = typeof input.path === "string" && input.path.trim().length > 0;
+  const hasUrl = typeof input.url === "string" && input.url.trim().length > 0;
+  if (hasPath === hasUrl) throw new Error("Provide exactly one absolute local path or HTTPS image URL.");
+  let bytes;
+  let sourcePath;
+  if (hasPath) {
+    if (!isAbsolute(input.path)) throw new Error("Local image path must be absolute.");
+    bytes = await readFile2(input.path);
+    sourcePath = input.path;
+    if (bytes.length > maxImageBytes) throw new Error("The approved local image exceeds the 25 MB safety limit.");
+  } else {
+    const remote = await readRemoteImage(input.url.trim());
+    bytes = remote.bytes;
+    sourcePath = remote.sourceUrl;
+  }
+  if (bytes.length === 0) throw new Error("The approved image is empty.");
   const mimeType = imageMimeType(bytes);
-  if (!mimeType) throw new Error("Local image must be a valid PNG, JPEG, GIF, or WebP file.");
-  const { path, ...rest } = input;
-  return { ...rest, sourcePath: path, mimeType, imageBase64: bytes.toString("base64") };
+  if (!mimeType) throw new Error("Image must be a valid PNG, JPEG, GIF, or WebP file.");
+  const { path, url: url2, ...rest } = input;
+  return { ...rest, sourcePath, mimeType, imageBase64: bytes.toString("base64") };
 }
 async function localizeBatchExports(data) {
   const exports = [];
@@ -33006,9 +33129,10 @@ server.registerTool("figma_copy_image_fill", {
 });
 server.registerTool("figma_place_local_image", {
   title: "Place an approved local image in Figma",
-  description: "Read an explicitly approved absolute local PNG/JPEG/GIF/WebP path (maximum 25 MB), create an image-filled rectangle in the current Figma page or parent, and return its node ID. No network fetch is performed.",
+  description: "Place an explicitly approved PNG/JPEG/GIF/WebP image from one absolute local path or HTTPS URL (maximum 25 MB) as an image-filled rectangle in the current Figma page or parent. URL fetches are restricted to public IPs and revalidated across redirects.",
   inputSchema: {
-    path: external_exports.string().trim().min(1).max(4096),
+    path: external_exports.string().trim().min(1).max(4096).optional(),
+    url: external_exports.string().trim().min(1).max(8192).optional().describe("HTTPS URL to an image. Only public IP destinations are fetched, with redirects revalidated."),
     name: external_exports.string().trim().min(1).max(200),
     width: external_exports.number().finite().min(1).max(1e4),
     height: external_exports.number().finite().min(1).max(1e4),
