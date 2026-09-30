@@ -163,6 +163,10 @@
         if (message?.type === "bridge-activity") {
           if (message.phase === "start") {
             showStatus(message.mutating ? "MCP is making changes…" : "MCP is reading…", message.mutating ? "editing" : "reading", message.label);
+          } else if (message.phase === "progress") {
+            const progress = message.progress || {};
+            const percent = Number.isFinite(progress.percent) ? ` ${Math.round(progress.percent)}%` : "";
+            showStatus(message.mutating ? `MCP is making changes…${percent}` : `MCP is reading…${percent}`, message.mutating ? "editing" : "reading", progress.message || message.label);
           } else {
             const success = message.ok === true;
             showStatus(success ? (message.mutating ? "Change complete" : "Read complete") : (message.mutating ? "Change failed" : "Read failed"), success ? "complete" : "failed", success ? message.label : `${message.label}: ${message.error || "Unknown error"}`);

@@ -2,7 +2,7 @@ figma.showUI(__html__, { width: 380, height: 250, title: "Local MCP Bridge" });
 
 let bridgeGeneration = 0;
 const bridgeUrl = "http://localhost:3846";
-const pluginVersion = "0.13.4";
+const pluginVersion = "0.14.0";
 const bridgeClientId = `figma-client-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const mutatingCommands = new Set([
   "moveResizeReparent", "updateText", "setTextCase", "deleteNode", "duplicateNode",
@@ -41,6 +41,10 @@ function bridgeActivity(command, phase, ok, error) {
   });
 }
 
+function bridgeProgress(command, progress) {
+  figma.ui.postMessage({ type: "bridge-activity", phase: "progress", ...activityForCommand(command.name), progress });
+}
+
 function errorMessage(error) {
   if (error instanceof Error && error.message) return error.message;
   if (error && typeof error === "object") {
@@ -65,6 +69,7 @@ async function bridgeRequest(path, options = {}) {
 function bridgeContext() {
   return {
     pluginVersion,
+    capabilities: ["composition-image-audit-v1"],
     editorType: figma.editorType,
     pageId: figma.currentPage.id,
     pageName: figma.currentPage.name,
@@ -98,13 +103,29 @@ async function postHeartbeat(sessionId) {
   });
 }
 
+async function postOperationProgress(sessionId, command, progress) {
+  return bridgeRequest("/v1/progress", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ sessionId, id: command.id, progress, info: bridgeContext() }),
+  });
+}
+
 async function executeWithHeartbeat(sessionId, command) {
   let heartbeatError = null;
   const heartbeat = () => postHeartbeat(sessionId).catch((error) => { heartbeatError = error; });
   await heartbeat();
   const timer = setInterval(heartbeat, 10_000);
   try {
-    const result = await execute(command.name, command.input);
+    const reportProgress = async (progress) => {
+      bridgeProgress(command, progress);
+      try {
+        await postOperationProgress(sessionId, command, progress);
+      } catch (error) {
+        if (isReplacementError(error)) throw error;
+      }
+    };
+    const result = await execute(command.name, command.input, reportProgress);
     if (isReplacementError(heartbeatError)) throw heartbeatError;
     return result;
   } finally {
@@ -1100,11 +1121,41 @@ function archiveNodes(input, prepared) {
   }
 }
 
-async function composeFrame(input) {
+function applyComposedImage(node, element) {
+  if (!element.imageSourceNodeId) return null;
+  if (!("fills" in node)) throw new Error(`Composed element “${element.key}” cannot accept an image fill.`);
+  const source = sceneNode(element.imageSourceNodeId);
+  const paint = cloneValue(imageFill(source));
+  if (element.imageScaleMode) paint.scaleMode = element.imageScaleMode;
+  if (element.imageTransform) {
+    paint.scaleMode = "CROP";
+    paint.imageTransform = element.imageTransform;
+  } else if (paint.scaleMode !== "CROP") {
+    delete paint.imageTransform;
+  }
+  node.fills = [paint];
+  return { sourceNodeId: source.id, scaleMode: paint.scaleMode, imageTransform: paint.imageTransform ?? null };
+}
+
+function auditComposedImages(elements, byKey) {
+  const required = elements.filter((element) => element.imageRequired || element.imageSourceNodeId);
+  const warnings = [];
+  for (const element of required) {
+    const node = byKey.get(element.key);
+    const fills = node && "fills" in node && node.fills !== figma.mixed ? node.fills : [];
+    const filled = fills.some((fill) => fill.type === "IMAGE" && fill.imageHash);
+    if (!filled) warnings.push({ key: element.key, nodeId: node?.id ?? null, name: element.name, warning: "Required image area has no image fill." });
+  }
+  return { requiredCount: required.length, filledCount: required.length - warnings.length, warningCount: warnings.length, warnings };
+}
+
+async function composeFrame(input, reportProgress = async () => {}) {
+  await reportProgress({ phase: "preflight", message: "Checking composition inputs and archive targets.", current: 2, total: 100, percent: 2 });
   const keys = new Set();
   for (const element of input.elements) {
     if (keys.has(element.key)) throw new Error(`Duplicate compose element key “${element.key}”.`);
     if (element.parentKey && !keys.has(element.parentKey)) throw new Error(`Element “${element.key}” refers to parentKey “${element.parentKey}” before that parent is created.`);
+    if (element.imageTransform && !element.imageSourceNodeId) throw new Error(`Element “${element.key}” supplies imageTransform without imageSourceNodeId.`);
     keys.add(element.key);
   }
   const preparedArchive = input.archiveNodeIds.length ? validateArchiveNodes(input.archiveNodeIds) : null;
@@ -1112,6 +1163,7 @@ async function composeFrame(input) {
   const created = [root];
   const byKey = new Map();
   try {
+    await reportProgress({ phase: "root", message: "Creating the native root frame.", current: 8, total: 100, percent: 8 });
     root.name = input.frame.name;
     root.resize(input.frame.width, input.frame.height);
     appendToParent(root, input.frame.parentId);
@@ -1126,7 +1178,10 @@ async function composeFrame(input) {
       throw new Error(`The composed frame would overlap ${placement.overlapCount} existing sibling node${placement.overlapCount === 1 ? "" : "s"}. Inspect canvas layout or choose collisionPolicy=report only when the overlap is intentional.`);
     }
 
-    for (const element of input.elements) {
+    for (let index = 0; index < input.elements.length; index += 1) {
+      const element = input.elements[index];
+      const elementPercent = 12 + Math.round((index / Math.max(1, input.elements.length)) * 58);
+      await reportProgress({ phase: "elements", message: `Creating ${element.name || element.key}.`, current: elementPercent, total: 100, percent: elementPercent });
       const parent = element.parentKey ? byKey.get(element.parentKey) : root;
       if (!parent || !("appendChild" in parent)) throw new Error(`Element “${element.key}” requires a frame parent.`);
       let node;
@@ -1139,6 +1194,7 @@ async function composeFrame(input) {
         node.y = element.y;
         await applyVisualStyle(node, element);
         applyAutoLayout(node, { direction: element.layout, itemSpacing: element.itemSpacing, padding: element.padding });
+        applyComposedImage(node, element);
       } else if (element.type === "rectangle") {
         node = figma.createRectangle();
         parent.appendChild(node);
@@ -1147,6 +1203,7 @@ async function composeFrame(input) {
         node.x = element.x;
         node.y = element.y;
         await applyVisualStyle(node, element);
+        applyComposedImage(node, element);
       } else {
         node = await createStyledText(element, parent);
       }
@@ -1158,9 +1215,14 @@ async function composeFrame(input) {
       throw new Error(`Composition created ${created.length - 1} of ${input.elements.length} requested native elements.`);
     }
 
+    await reportProgress({ phase: "image-audit", message: "Checking required image areas.", current: 74, total: 100, percent: 74 });
+    const imageAudit = auditComposedImages(input.elements, byKey);
+    if (input.audit) await reportProgress({ phase: "text-audit", message: "Auditing text overflow.", current: 80, total: 100, percent: 80 });
     const audits = input.audit ? [{ frameId: root.id, result: auditSummary(await auditTextOverflow(root, { includeHidden: false })) }] : [];
+    if (input.export) await reportProgress({ phase: "export", message: "Exporting the composed frame preview.", current: 88, total: 100, percent: 88 });
     const exports = input.export ? [{ frameId: root.id, result: { ...(await screenshotNode(root, input)), nodeName: root.name } }] : [];
     focus(root);
+    const verificationComplete = audits.every((item) => !item.error) && exports.every((item) => !item.error) && imageAudit.warningCount === 0;
     const result = {
       ok: true,
       createdNodeIds: created.map((node) => node.id),
@@ -1168,13 +1230,21 @@ async function composeFrame(input) {
       elements: [...byKey].map(([key, node]) => ({ key, id: node.id, name: node.name, type: node.type })),
       placement,
       audits,
+      imageAudit,
       exports,
-      verificationComplete: audits.every((item) => !item.error) && exports.every((item) => !item.error),
+      verificationComplete,
     };
-    if (preparedArchive) {
+    if (preparedArchive && verificationComplete) {
+      await reportProgress({ phase: "archive", message: "Archiving the verified previous layout.", current: 96, total: 100, percent: 96 });
       const archived = archiveNodes({ nodeIds: input.archiveNodeIds, replacementNodeId: root.id, archiveName: input.archiveName, reason: input.archiveReason }, { ...preparedArchive, replacement: root });
       result.archived = archived.archive;
+    } else if (preparedArchive) {
+      result.archiveSkipped = { reason: "Composition verification is incomplete; previous nodes were preserved.", nodeIds: input.archiveNodeIds };
     }
+    // The layout is committed. A lost progress connection must not undo it.
+    try {
+      await reportProgress({ phase: "complete", message: verificationComplete ? "Composition complete and verified." : "Composition complete with verification warnings.", current: 100, total: 100, percent: 100 });
+    } catch (_) {}
     return result;
   } catch (error) {
     if (!root.removed) root.remove();
@@ -1484,7 +1554,7 @@ function applyAutoLayout(node, input) {
   }
 }
 
-async function execute(name, input) {
+async function execute(name, input, reportProgress = async () => {}) {
   if (name === "getSelection") {
     return { page: { id: figma.currentPage.id, name: figma.currentPage.name }, selection: figma.currentPage.selection.map(serializeNode) };
   }
@@ -1663,7 +1733,7 @@ async function execute(name, input) {
 
   if (name === "archiveNodes") return archiveNodes(input);
 
-  if (name === "composeFrame") return composeFrame(input);
+  if (name === "composeFrame") return composeFrame(input, reportProgress);
 
   if (name === "copyStyleFromNode") return copyStyleFromNode(input);
 

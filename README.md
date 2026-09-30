@@ -35,6 +35,12 @@ The result contains ordered copy, optional overflow audits, and local PNG paths 
 
 In **0.13.1**, the review call gathers copy and overflow results in one packaged plugin operation, followed by one PNG export command per artboard. A two-artboard review with audits uses three plugin commands instead of five; the MCP tool name and output shape stay the same. See the [changelog](CHANGELOG.md).
 
+## Track a long composition
+
+Use `figma_start_composition` when a board may take a while. It returns an operation ID immediately; `figma_operation_status` reports the current phase and percentage, then the verified result. Reusing the same operation ID resumes that request instead of creating a duplicate.
+
+Composed frames and rectangles can copy an existing Figma image fill with `imageSourceNodeId`. Mark an expected image area with `imageRequired: true`; an empty required area makes `verificationComplete` false and prevents the previous layout from being archived.
+
 ## Update or test
 
 After updating, restart the `figma_local` MCP process in your client and reload the Figma development plugin. Check `figma_bridge_status`: both bridge and plugin should report the same version. The local status page is at [localhost:3846](http://localhost:3846/). An old running process may still report its previous version until restarted.

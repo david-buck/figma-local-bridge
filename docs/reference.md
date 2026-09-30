@@ -27,9 +27,10 @@ Delete only a clearly stray element identified by the user. Preserve all other n
 
 1. List artboards, read the target in `summary` mode, and export its current PNG.
 2. Call `figma_list_design_system_assets` and `figma_list_page_tokens`. Prefer verified linked components, named styles, and variables; use `figma_copy_style_from_node` against an on-brand source node when needed. Do not approximate available assets, fonts, or colours.
-3. Call `figma_compose_frame` with one named replacement frame and ordered frame/rectangle/text elements. Use styled spans for mixed emphasis and typographic case inside a single text layer; keep the stored copy in natural case. The command removes its whole new subtree if any element fails.
-4. Prefer passing explicit `archiveNodeIds` to the composer so previous sibling content is grouped and hidden only after the replacement succeeds. Otherwise verify the replacement, then call `figma_supersede_layout` or `figma_archive_nodes`.
-5. Inspect the returned compact overflow audit and local PNG. Re-read in `full` mode only when hierarchy or hidden variants require diagnosis.
+3. Call `figma_compose_frame` with one named replacement frame and ordered frame/rectangle/text elements. Use styled spans for mixed emphasis and typographic case inside a single text layer; keep the stored copy in natural case. A frame or rectangle can set `imageSourceNodeId` to reuse an existing image fill and `imageRequired: true` to make an empty image area fail completion verification.
+4. For a potentially slow board, call `figma_start_composition`, then poll `figma_operation_status`. Reuse its operation ID after interruption; never start a second composition while the first is queued or running.
+5. Prefer passing explicit `archiveNodeIds` to the composer. Previous sibling content is grouped and hidden only when text/export/image verification is complete; otherwise it is preserved and the result explains why archival was skipped.
+6. Inspect the returned compact overflow audit, image audit, and local PNG. Re-read in `full` mode only when hierarchy or hidden variants require diagnosis.
 
 ### Colour-token workflow
 
@@ -65,7 +66,8 @@ The bridge keeps its command surface intentionally narrow. It exposes the follow
 - `figma_export_frame_png` — write a PNG to `~/Pictures/Figma MCP Exports` and return only its absolute path and dimensions.
 - `figma_prepare_review` — read and optionally audit one to eight ordered artboards in one packaged plugin operation, then export them locally in the same MCP call.
 - `figma_archive_nodes` / `figma_supersede_layout` — hide explicit prior siblings in a named reversible group and record the replacement relationship.
-- `figma_compose_frame` — atomically create a native frame in the page or a section, with root auto-layout, panels/dividers and styled-span text; reject accidental overlap and empty/incomplete results.
+- `figma_compose_frame` — create a tracked native frame in the page or a section, with root auto-layout, panels/dividers, styled-span text, direct reuse of existing image fills, and required-image verification.
+- `figma_start_composition` / `figma_operation_status` — start a long composition without blocking, then inspect its phase, percentage, warnings, error, or completed result before retrying.
 - `figma_copy_style_from_node` / `figma_list_page_tokens` — inherit verified on-brand styling and discover local variables/styles plus page usage.
 - `figma_list_design_system_assets` — discover components, styles, and variables verified in the current file, including remote assets currently used and enabled linked-library variable collections.
 - `figma_create_component_instance` / `figma_apply_design_style` — create a linked instance or apply a named local/library style by verified ID or key.

@@ -249,7 +249,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     capabilities: {},
     clientInfo: { name: "figma-bridge-test", version: "1.0.0" },
   });
-  assert.equal(initialized.serverInfo.version, "0.13.4");
+  assert.equal(initialized.serverInfo.version, "0.14.0");
   assert.match(initialized.instructions, /figma_prepare_review/);
   assert.match(initialized.instructions, /figma_apply_copy_updates/);
   rpc.notify("notifications/initialized");
@@ -258,7 +258,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
   const toolNames = new Set(listed.tools.map((tool) => tool.name));
   for (const name of [
     "figma_prepare_review", "figma_read_copy", "figma_apply_copy_updates", "figma_set_text_frame", "figma_split_text_block",
-    "figma_archive_nodes", "figma_supersede_layout", "figma_compose_frame", "figma_copy_style_from_node", "figma_list_page_tokens", "figma_copy_image_fill", "figma_place_local_image",
+    "figma_archive_nodes", "figma_supersede_layout", "figma_compose_frame", "figma_start_composition", "figma_operation_status", "figma_copy_style_from_node", "figma_list_page_tokens", "figma_copy_image_fill", "figma_place_local_image",
     "figma_get_user_preferences", "figma_set_user_preference", "figma_delete_user_preference", "figma_revert_user_preferences", "figma_resolve_design_choice",
     "figma_list_design_system_assets", "figma_create_component_instance", "figma_apply_design_style",
     "figma_comment_status", "figma_list_comments", "figma_post_comment", "figma_delete_comment",
@@ -352,7 +352,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
   const connected = await postJson(`${baseUrl}/v1/connect`, {
     sessionId,
     clientId: "test-client",
-    info: { pluginVersion: "test", editorType: "figma", pageId: "0:1", pageName: "Campaign", selectionCount: 0 },
+    info: { pluginVersion: "test", capabilities: ["composition-image-audit-v1"], editorType: "figma", pageId: "0:1", pageName: "Campaign", selectionCount: 0 },
   });
   assert.equal(connected.status, 200);
   const status = toolJson(await rpc.request("tools/call", { name: "figma_bridge_status", arguments: {} }));
@@ -384,7 +384,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     capabilities: {},
     clientInfo: { name: "figma-bridge-proxy-test", version: "1.0.0" },
   });
-  assert.equal(proxyInitialized.serverInfo.version, "0.13.4");
+  assert.equal(proxyInitialized.serverInfo.version, "0.14.0");
   proxyRpc.notify("notifications/initialized");
   const proxyStatus = toolJson(await proxyRpc.request("tools/call", { name: "figma_bridge_status", arguments: {} }));
   assert.equal(proxyStatus.connected, true);
@@ -547,6 +547,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     return {
       createdNodeIds: ["7:1", "7:2", "7:3"],
       frame: { id: "7:1", name: "Replacement" },
+      imageAudit: { requiredCount: 0, filledCount: 0, warningCount: 0, warnings: [] },
       elements: [{ key: "panel", id: "7:2" }, { key: "copy", id: "7:3" }],
       audits: [{ frameId: "7:1", result: { frame: { id: "7:1" }, warningCount: 0, text: [] } }],
       exports: [{ frameId: "7:1", result: { imageBase64: onePixelPng, mimeType: "image/png", nodeId: "7:1", nodeName: "Replacement", width: 1, height: 1 } }],
@@ -564,6 +565,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
     },
   }));
   await composeWorker;
+  assert.match(composed.operationId, /^[0-9a-f-]{36}$/);
   assert.equal(composed.verificationComplete, true);
   assert.equal(composed.exports[0].result.imageBase64, undefined);
   const composePng = await readFile(composed.exports[0].result.path);
@@ -584,6 +586,57 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
   const emptyComposeError = JSON.parse(emptyCompose.content[0].text);
   assert.equal(emptyComposeError.ok, false);
   assert.equal(emptyComposeError.error.code, "COMPOSITION_EMPTY_OR_INCOMPLETE");
+
+  const trackedArguments = {
+    frame: { name: "Tracked board", width: 320, height: 220, x: 1_200, y: 0 },
+    elements: [{ type: "rectangle", key: "photo", name: "Required photo", width: 280, height: 160, x: 20, y: 20, imageRequired: true }],
+    audit: false,
+    export: false,
+  };
+  const startedComposition = toolJson(await rpc.request("tools/call", { name: "figma_start_composition", arguments: trackedArguments }));
+  assert.equal(startedComposition.state, "queued");
+  assert.match(startedComposition.operationId, /^[0-9a-f-]{36}$/);
+  const trackedPoll = await fetch(`${baseUrl}/v1/poll?sessionId=${sessionId}&pageId=0%3A1&pageName=Campaign&selectionCount=0`);
+  assert.equal(trackedPoll.status, 200);
+  const trackedCommand = (await trackedPoll.json()).command;
+  assert.equal(trackedCommand.name, "composeFrame");
+  assert.equal(trackedCommand.id, startedComposition.operationId);
+  const progressResponse = await postJson(`${baseUrl}/v1/progress`, {
+    sessionId,
+    id: trackedCommand.id,
+    progress: { phase: "elements", message: "Creating Required photo.", current: 55, total: 100, percent: 55 },
+  });
+  assert.equal(progressResponse.status, 204);
+  const runningComposition = toolJson(await rpc.request("tools/call", {
+    name: "figma_operation_status",
+    arguments: { operationId: startedComposition.operationId },
+  }));
+  assert.equal(runningComposition.state, "running");
+  assert.equal(runningComposition.progress.percent, 55);
+  const trackedResult = {
+    ok: true,
+    createdNodeIds: ["11:1", "11:2"],
+    frame: { id: "11:1", name: "Tracked board" },
+    elements: [{ key: "photo", id: "11:2", name: "Required photo", type: "RECTANGLE" }],
+    audits: [],
+    imageAudit: { requiredCount: 1, filledCount: 0, warningCount: 1, warnings: [{ key: "photo", nodeId: "11:2", warning: "Required image area has no image fill." }] },
+    exports: [],
+    verificationComplete: false,
+  };
+  const trackedResultResponse = await postJson(`${baseUrl}/v1/result`, { sessionId, id: trackedCommand.id, ok: true, result: trackedResult });
+  assert.equal(trackedResultResponse.status, 204);
+  const completedComposition = toolJson(await rpc.request("tools/call", {
+    name: "figma_operation_status",
+    arguments: { operationId: startedComposition.operationId },
+  }));
+  assert.equal(completedComposition.state, "succeeded");
+  assert.equal(completedComposition.result.verificationComplete, false);
+  assert.equal(completedComposition.result.imageAudit.warningCount, 1);
+  const resumedComposition = toolJson(await rpc.request("tools/call", {
+    name: "figma_start_composition",
+    arguments: { operationId: startedComposition.operationId, ...trackedArguments },
+  }));
+  assert.equal(resumedComposition.state, "succeeded");
 
   const approvedImagePath = join(exportDirectory, "approved.png");
   await writeFile(approvedImagePath, Buffer.from(onePixelPng, "base64"));
@@ -687,7 +740,7 @@ test("bridge advertises and orchestrates review and copy-sync workflows", async 
 // Execute the actual transport handlers with controlled timers and no listening socket.
 async function commandHarness() {
   const source = await readFile(new URL("../server.mjs", import.meta.url), "utf8");
-  const session = { queue: [], pending: new Map(), poll: null };
+  const session = { sessionId: "test", info: { capabilities: ["composition-image-audit-v1"] }, queue: [], pending: new Map(), poll: null };
   const timers = new Map();
   let nextId = 0;
   let handler;
@@ -695,9 +748,18 @@ async function commandHarness() {
     URL,
     http: { createServer(callback) { handler = callback; } },
     host: "127.0.0.1", port: 0,
+    operations: new Map(),
+    sessions: new Map([["test", session]]),
+    replacedSessions: new Map(),
+    compositionImageCapability: "composition-image-audit-v1",
+    operationRetentionMs: 60 * 60_000,
+    operationHardTimeoutMs: 30 * 60_000,
     activeSessions: () => [session],
     getSession: () => session,
     updateSession() {},
+    cleanString: (value, maxLength = 200) => typeof value === "string" ? value.trim().slice(0, maxLength) : undefined,
+    requireCompositionResult: (data) => data,
+    localizeBatchExports: async (data) => data,
     isAllowedBrowserOrigin: () => true,
     readJson: async (request) => request.body,
     randomUUID: () => `command-${++nextId}`,
@@ -707,14 +769,23 @@ async function commandHarness() {
   };
   vm.createContext(sandbox);
   vm.runInContext(
-    source.slice(source.indexOf("function completePoll("), source.indexOf("function addSession(")) +
+    source.slice(source.indexOf("function rejectSession("), source.indexOf("function activeSessions(")) +
+    source.slice(source.indexOf("function cleanOperations("), source.indexOf("function addSession(")) +
     source.slice(source.indexOf("const bridge = http.createServer("), source.indexOf("async function ownerRequest(")), sandbox,
   );
   return {
     session,
     send: () => sandbox.sendLocalCommand("mutate", {}, 1_000),
+    sendTracked: (options = {}) => sandbox.sendTrackedLocalCommand("composeFrame", { elements: [{}] }, { timeoutMs: 1_000, ...options }),
+    operationStatus: (operationId) => sandbox.operationSnapshot(sandbox.getOperation(operationId), true),
+    replaceSession: () => sandbox.rejectSession(session, "Session replaced.", 409, true),
     expire() {
       const [token, callback] = timers.entries().next().value;
+      timers.delete(token);
+      callback();
+    },
+    expireLatest() {
+      const [token, callback] = [...timers.entries()].at(-1);
       timers.delete(token);
       callback();
     },
@@ -789,4 +860,88 @@ test("dispatched timeout reports an unknown outcome and ignores a late result", 
   assert.equal(late.status, 404);
   assert.equal(harness.session.pending.size, 0);
   assert.equal(harness.session.queue.length, 0);
+});
+
+test("tracked composition wait timeout preserves progress and accepts a late result", async () => {
+  const harness = await commandHarness();
+  const result = harness.sendTracked();
+  const poll = await harness.request("GET", "/v1/poll?sessionId=test");
+  const operationId = poll.body.command.id;
+  const rejected = assert.rejects(result, new RegExp(`operation ${operationId} is still running.*figma_operation_status`, "i"));
+  harness.expireLatest();
+  await rejected;
+  assert.equal(harness.operationStatus(operationId).state, "running");
+  const progress = await harness.request("POST", "/v1/progress", { sessionId: "test", id: operationId, progress: { phase: "export", message: "Exporting preview.", percent: 88 } });
+  assert.equal(progress.status, 204);
+  assert.equal(harness.operationStatus(operationId).progress.percent, 88);
+  const late = await harness.request("POST", "/v1/result", { sessionId: "test", id: operationId, ok: true, result: { frame: { id: "1:1" } } });
+  assert.equal(late.status, 204);
+  assert.equal(harness.operationStatus(operationId).state, "succeeded");
+  assert.equal(harness.operationStatus(operationId).result.frame.id, "1:1");
+  assert.equal(harness.session.pending.size, 0);
+});
+
+test("tracked compositions reject an old plugin before queueing any mutation", async () => {
+  const harness = await commandHarness();
+  harness.session.info = { pluginVersion: "0.13.4" };
+  await assert.rejects(harness.sendTracked({ waitForCompletion: false }), /reload.*updated.*plugin/i);
+  assert.equal(harness.session.pending.size, 0);
+  assert.equal(harness.session.queue.length, 0);
+});
+
+for (const dispatched of [false, true]) {
+  test(`session replacement marks ${dispatched ? "dispatched" : "queued"} tracked work ${dispatched ? "unknown" : "failed"}`, async () => {
+    const harness = await commandHarness();
+    const started = await harness.sendTracked({ waitForCompletion: false });
+    if (dispatched) await harness.request("GET", "/v1/poll?sessionId=test");
+    harness.replaceSession();
+    const status = harness.operationStatus(started.operationId);
+    assert.equal(status.state, dispatched ? "unknown" : "failed");
+    assert.match(status.error, dispatched ? /inspect.*document before retrying/i : /not dispatched/i);
+    assert.equal(harness.session.pending.size, 0);
+    assert.equal(harness.session.queue.length, 0);
+  });
+}
+
+test("a proxy refuses an old owner before sending a tracked command", async () => {
+  const source = await readFile(new URL("../server.mjs", import.meta.url), "utf8");
+  for (const compatible of [false, true]) {
+    const requests = [];
+    const sandbox = {
+      initialBridgeRole: Promise.resolve(), bridgeRole: "proxy",
+      trackedCompositionCapability: "tracked-composition-v1",
+      async ownerRequest(path, options) {
+        requests.push({ path, options });
+        if (path === "/v1/status") return { bridge: { version: compatible ? "0.14.0" : "0.13.4", capabilities: compatible ? ["tracked-composition-v1"] : undefined } };
+        return { result: { operationId: "same-id", state: "queued" }, operation: { state: "running" } };
+      },
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(source.slice(source.indexOf("async function sendTrackedCommand("), source.indexOf("function output(")), sandbox);
+    if (!compatible) {
+      await assert.rejects(sandbox.sendTrackedCommand("composeFrame", {}, { operationId: "same-id", waitForCompletion: false }), /restart.*updated build.*no command was sent/i);
+      await assert.rejects(sandbox.operationStatusForMcp("same-id", true), /restart/i);
+      assert.ok(requests.every((request) => request.path === "/v1/status"));
+    } else {
+      for (let retry = 0; retry < 2; retry++) await sandbox.sendTrackedCommand("composeFrame", {}, { operationId: "same-id", waitForCompletion: false });
+      const commands = requests.filter((request) => request.path === "/v1/mcp-command");
+      assert.equal(commands.length, 2);
+      assert.ok(commands.every((request) => JSON.parse(request.options.body).operationId === "same-id"));
+      assert.equal((await sandbox.operationStatusForMcp("same-id", true)).state, "running");
+    }
+  }
+});
+
+test("composition completion requires consistent image audit evidence", async () => {
+  const source = await readFile(new URL("../server.mjs", import.meta.url), "utf8");
+  const sandbox = {};
+  vm.createContext(sandbox);
+  vm.runInContext(source.slice(source.indexOf("function requireCompositionResult("), source.indexOf("const nodeId =")), sandbox);
+  const base = { frame: { id: "root" }, createdNodeIds: ["root", "photo"], elements: [{ key: "photo", id: "photo" }], verificationComplete: true };
+  assert.throws(() => sandbox.requireCompositionResult(base, 1, 1), /image audit evidence/);
+  assert.throws(() => sandbox.requireCompositionResult({ ...base, imageAudit: { requiredCount: 0, filledCount: 0, warningCount: 0, warnings: [] } }, 1, 1), /image audit evidence/);
+  const imageAudit = { requiredCount: 1, filledCount: 0, warningCount: 1, warnings: [{}] };
+  assert.throws(() => sandbox.requireCompositionResult({ ...base, imageAudit }, 1, 1), /image audit evidence/);
+  assert.throws(() => sandbox.requireCompositionResult({ ...base, verificationComplete: false, imageAudit, archived: {} }, 1, 1), /image audit evidence/);
+  assert.equal(sandbox.requireCompositionResult({ ...base, verificationComplete: false, imageAudit }, 1, 1).verificationComplete, false);
 });

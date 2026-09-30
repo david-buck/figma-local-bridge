@@ -31239,7 +31239,11 @@ var launchParentPid = process.ppid;
 var sessionFreshnessMs = 35e3;
 var replacedSessionRetentionMs = 5 * 6e4;
 var proxyHealthIntervalMs = 2e3;
-var bridgeVersion = "0.13.4";
+var operationRetentionMs = 60 * 6e4;
+var operationHardTimeoutMs = 30 * 6e4;
+var bridgeVersion = "0.14.0";
+var trackedCompositionCapability = "tracked-composition-v1";
+var compositionImageCapability = "composition-image-audit-v1";
 var exportDirectory = process.env.FIGMA_EXPORT_DIR ?? join2(homedir(), "Pictures", "Figma MCP Exports");
 var preferencesDirectory = process.env.FIGMA_PREFERENCES_DIR ?? join2(homedir(), ".figma-local-bridge");
 var preferencesPath = join2(preferencesDirectory, "preferences.json");
@@ -31254,6 +31258,7 @@ if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
 }
 var sessions = /* @__PURE__ */ new Map();
 var replacedSessions = /* @__PURE__ */ new Map();
+var operations = /* @__PURE__ */ new Map();
 var bridgeRole = "starting";
 var bridgeListening = false;
 var stopping = false;
@@ -31333,6 +31338,7 @@ function cleanSessionInfo(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   return Object.fromEntries(Object.entries({
     pluginVersion: cleanString(value.pluginVersion, 40),
+    capabilities: Array.isArray(value.capabilities) ? value.capabilities.filter((item) => typeof item === "string").slice(0, 30).map((item) => item.slice(0, 100)) : void 0,
     editorType: cleanString(value.editorType, 40),
     pageId: cleanString(value.pageId),
     pageName: cleanString(value.pageName),
@@ -31353,9 +31359,13 @@ function rejectSession(session, message, status = 409, rememberReplacement = fal
   }
   for (const pending of session.pending.values()) {
     clearTimeout(pending.timeout);
-    pending.reject(new Error(message));
+    if (pending.operation) {
+      const dispatched = pending.operation.startedAt !== null;
+      settleOperation(pending.operation, dispatched ? "unknown" : "failed", new Error(dispatched ? `${message} The operation was dispatched, so its outcome is unknown. Inspect the affected Figma document before retrying.` : `${message} The operation was not dispatched; no changes were made by this command.`));
+    } else pending.reject(new Error(message));
   }
   session.pending.clear();
+  session.queue.length = 0;
   sessions.delete(session.sessionId);
 }
 function activeSessions(now = Date.now()) {
@@ -31367,13 +31377,14 @@ function bridgeStatusSnapshot() {
   return {
     connected: active.length === 1,
     activePluginCount: active.length,
-    bridge: { host, port, version: bridgeVersion, role: "owner", processId: process.pid },
+    bridge: { host, port, version: bridgeVersion, role: "owner", processId: process.pid, capabilities: [trackedCompositionCapability] },
     ...session ? {
       plugin: {
         ...session.info,
         connectedAt: new Date(session.connectedAt).toISOString(),
         lastSeenAt: new Date(session.lastSeenAt).toISOString(),
-        pendingCommandCount: session.pending.size
+        pendingCommandCount: session.pending.size,
+        activeOperations: [...session.pending.values()].filter((pending) => pending.operation).map((pending) => operationSnapshot(pending.operation, false))
       }
     } : {}
   };
@@ -31406,6 +31417,7 @@ var statusPage = `<!doctype html>
         <dt>Bridge</dt><dd id="bridge">\u2014</dd>
         <dt>Figma page</dt><dd id="page">\u2014</dd>
         <dt>Plugin</dt><dd id="plugin">\u2014</dd>
+        <dt>Operation</dt><dd id="operation">\u2014</dd>
         <dt>Last seen</dt><dd id="seen">\u2014</dd>
       </dl>
       <p>Open the Local MCP Bridge development plugin in the target Figma Desktop file and leave its panel open. This page refreshes automatically.</p>
@@ -31422,6 +31434,8 @@ var statusPage = `<!doctype html>
           set('bridge', 'v' + data.bridge.version + ' on ' + data.bridge.host + ':' + data.bridge.port);
           set('page', data.plugin?.pageName);
           set('plugin', data.plugin?.pluginVersion ? 'v' + data.plugin.pluginVersion : null);
+          const operation = data.plugin?.activeOperations?.[0];
+          set('operation', operation ? operation.progress.message + ' (' + operation.progress.percent + '%) \u2014 ' + operation.operationId : null);
           set('seen', data.plugin?.lastSeenAt ? new Date(data.plugin.lastSeenAt).toLocaleTimeString() : null);
         } catch {
           set('label', 'Bridge unavailable');
@@ -31431,6 +31445,141 @@ var statusPage = `<!doctype html>
     </script>
   </body>
 </html>`;
+function cleanOperations(now = Date.now()) {
+  for (const [operationId, operation] of operations) {
+    const terminal = ["succeeded", "failed", "unknown"].includes(operation.state);
+    if (terminal && now - operation.updatedAt > operationRetentionMs) operations.delete(operationId);
+  }
+}
+function operationErrorMessage(error51) {
+  return error51 instanceof Error && error51.message ? error51.message : String(error51);
+}
+function operationSnapshot(operation, includeResult = true) {
+  return {
+    operationId: operation.id,
+    name: operation.name,
+    state: operation.state,
+    createdAt: new Date(operation.createdAt).toISOString(),
+    updatedAt: new Date(operation.updatedAt).toISOString(),
+    startedAt: operation.startedAt ? new Date(operation.startedAt).toISOString() : null,
+    completedAt: operation.completedAt ? new Date(operation.completedAt).toISOString() : null,
+    progress: operation.progress,
+    ...operation.error ? { error: operation.error } : {},
+    ...includeResult && operation.state === "succeeded" ? { result: operation.result } : {}
+  };
+}
+function getOperation(operationId) {
+  cleanOperations();
+  const operation = operations.get(operationId);
+  if (!operation) throw new Error(`No tracked Figma operation exists with ID ${operationId}. It may have expired after one hour.`);
+  return operation;
+}
+function setOperationProgress(operation, value) {
+  if (!operation || ["succeeded", "failed", "unknown"].includes(operation.state)) return;
+  const total = Number.isFinite(value?.total) && value.total > 0 ? value.total : 100;
+  const current = Number.isFinite(value?.current) ? Math.max(0, Math.min(total, value.current)) : 0;
+  const percent = Number.isFinite(value?.percent) ? Math.max(0, Math.min(100, value.percent)) : Math.round(current / total * 100);
+  operation.state = "running";
+  operation.startedAt ??= Date.now();
+  operation.updatedAt = Date.now();
+  operation.progress = {
+    phase: cleanString(value?.phase, 80) ?? "running",
+    message: cleanString(value?.message, 500) ?? "Figma is processing the operation.",
+    current,
+    total,
+    percent
+  };
+}
+function settleOperation(operation, state, value) {
+  if (!operation || ["succeeded", "failed", "unknown"].includes(operation.state)) return;
+  operation.state = state;
+  operation.updatedAt = Date.now();
+  operation.completedAt = Date.now();
+  operation.progress = {
+    phase: state,
+    message: state === "succeeded" ? "Operation complete." : state === "unknown" ? "Operation outcome is unknown." : "Operation failed.",
+    current: state === "succeeded" ? 100 : operation.progress.current,
+    total: 100,
+    percent: state === "succeeded" ? 100 : operation.progress.percent
+  };
+  if (state === "succeeded") {
+    operation.result = value;
+    operation.resolve(value);
+  } else {
+    operation.error = operationErrorMessage(value);
+    operation.reject(value instanceof Error ? value : new Error(operation.error));
+  }
+}
+function createTrackedOperation(session, name, input, requestedId) {
+  cleanOperations();
+  const operationId = requestedId ?? randomUUID();
+  const fingerprint = JSON.stringify(input);
+  const existing = operations.get(operationId);
+  if (existing) {
+    if (existing.name !== name || existing.inputFingerprint !== fingerprint) throw new Error(`Operation ID ${operationId} is already assigned to a different request.`);
+    return { operation: existing, created: false };
+  }
+  let resolve;
+  let reject;
+  const completion = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  completion.catch(() => {
+  });
+  const now = Date.now();
+  const operation = {
+    id: operationId,
+    name,
+    inputFingerprint: fingerprint,
+    requestedElementCount: Array.isArray(input.elements) ? input.elements.length : null,
+    requiredImageCount: (input.elements ?? []).filter((element) => element.imageRequired || element.imageSourceNodeId).length,
+    state: "queued",
+    createdAt: now,
+    updatedAt: now,
+    startedAt: null,
+    completedAt: null,
+    progress: { phase: "queued", message: "Waiting for the Figma plugin.", current: 0, total: 100, percent: 0 },
+    result: null,
+    error: null,
+    completion,
+    resolve,
+    reject
+  };
+  const command = { id: operationId, operationId, name, input };
+  const timeout = setTimeout(() => {
+    session.pending.delete(operationId);
+    const queuedIndex = session.queue.findIndex((queued) => queued.id === operationId);
+    if (queuedIndex !== -1) session.queue.splice(queuedIndex, 1);
+    const error51 = new Error(queuedIndex !== -1 ? `Tracked Figma operation ${operationId} was never dispatched and expired.` : `Tracked Figma operation ${operationId} exceeded its 30-minute safety limit. Its final outcome is unknown; inspect the document before retrying.`);
+    settleOperation(operation, queuedIndex === -1 ? "unknown" : "failed", error51);
+  }, operationHardTimeoutMs);
+  operations.set(operationId, operation);
+  session.pending.set(operationId, { operation, timeout });
+  session.queue.push(command);
+  completePoll(session);
+  return { operation, created: true };
+}
+async function waitForOperation(operation, timeoutMs) {
+  if (operation.state === "succeeded") return operation.result;
+  if (["failed", "unknown"].includes(operation.state)) throw new Error(operation.error);
+  let timeout;
+  try {
+    return await Promise.race([
+      operation.completion,
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => {
+          const error51 = new Error(`Figma operation ${operation.id} is still ${operation.state} after ${Math.round(timeoutMs / 1e3)} seconds. Call figma_operation_status with this operation ID before retrying.`);
+          error51.code = "OPERATION_STILL_RUNNING";
+          error51.operationId = operation.id;
+          reject(error51);
+        }, timeoutMs);
+      })
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 function completePoll(session) {
   if (!session.poll) return;
   const command = dequeuePendingCommand(session);
@@ -31443,7 +31592,11 @@ function completePoll(session) {
 function dequeuePendingCommand(session) {
   while (session.queue.length > 0) {
     const command = session.queue.shift();
-    if (session.pending.has(command.id)) return command;
+    if (session.pending.has(command.id)) {
+      const operation = operations.get(command.operationId);
+      if (operation) setOperationProgress(operation, { phase: "dispatched", message: "Sent to the Figma plugin.", current: 1, total: 100, percent: 1 });
+      return command;
+    }
   }
   return null;
 }
@@ -31533,7 +31686,20 @@ var bridge = http.createServer(async (request, response) => {
       if (!body.input || typeof body.input !== "object" || Array.isArray(body.input)) return json2(response, 400, { error: "Command input must be an object." });
       const timeoutMs = body.timeoutMs === void 0 ? 3e4 : body.timeoutMs;
       if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1e3 || timeoutMs > 6e5) return json2(response, 400, { error: "timeoutMs must be between 1000 and 600000." });
+      if (body.tracked) {
+        const result = await sendTrackedLocalCommand(body.name, body.input, {
+          operationId: body.operationId,
+          waitForCompletion: body.waitForCompletion !== false,
+          timeoutMs
+        });
+        return json2(response, 200, { result });
+      }
       return json2(response, 200, { result: await sendLocalCommand(body.name, body.input, timeoutMs) });
+    }
+    if (request.method === "POST" && url2.pathname === "/v1/mcp-operation-status") {
+      const body = await readJson(request);
+      if (typeof body.operationId !== "string" || body.operationId.length > 200) return json2(response, 400, { error: "A valid operation ID is required." });
+      return json2(response, 200, { operation: operationSnapshot(getOperation(body.operationId), body.includeResult !== false) });
     }
     if (request.method === "POST" && url2.pathname === "/v1/connect") {
       const body = await readJson(request);
@@ -31587,6 +31753,19 @@ var bridge = http.createServer(async (request, response) => {
       updateSession(session, body.info);
       return json2(response, 204);
     }
+    if (request.method === "POST" && url2.pathname === "/v1/progress") {
+      const body = await readJson(request);
+      const session = getSession(body.sessionId);
+      if (!session) {
+        const replaced = sessionWasReplaced(body.sessionId);
+        return json2(response, replaced ? 409 : 401, { error: replaced ? "This plugin session was replaced by a newer Figma connection." : "Unknown bridge session." });
+      }
+      updateSession(session, body.info);
+      const pending = session.pending.get(body.id);
+      if (!pending?.operation) return json2(response, 404, { error: "No matching tracked operation." });
+      setOperationProgress(pending.operation, body.progress);
+      return json2(response, 204);
+    }
     if (request.method === "POST" && url2.pathname === "/v1/result") {
       const body = await readJson(request);
       const session = getSession(body.sessionId);
@@ -31599,13 +31778,30 @@ var bridge = http.createServer(async (request, response) => {
       if (!pending) return json2(response, 404, { error: "No matching command." });
       session.pending.delete(body.id);
       clearTimeout(pending.timeout);
-      if (body.ok) pending.resolve(body.result);
+      if (pending.operation) {
+        if (body.ok) {
+          try {
+            const verified = pending.operation.name === "composeFrame" ? requireCompositionResult(body.result, pending.operation.requestedElementCount, pending.operation.requiredImageCount) : body.result;
+            const result = pending.operation.name === "composeFrame" ? await localizeBatchExports(verified) : verified;
+            settleOperation(pending.operation, "succeeded", result);
+          } catch (error51) {
+            error51.message += " The plugin reported completion but verification failed. Inspect the affected Figma document before retrying.";
+            settleOperation(pending.operation, "unknown", error51);
+          }
+        } else {
+          settleOperation(pending.operation, "failed", new Error(typeof body.error === "string" ? body.error : "The Figma plugin rejected the command."));
+        }
+      } else if (body.ok) pending.resolve(body.result);
       else pending.reject(new Error(typeof body.error === "string" ? body.error : "The Figma plugin rejected the command."));
       return json2(response, 204);
     }
     return json2(response, 404, { error: "Not found." });
   } catch (error51) {
-    return json2(response, 400, { error: error51 instanceof Error ? error51.message : String(error51) });
+    return json2(response, 400, {
+      error: error51 instanceof Error ? error51.message : String(error51),
+      ...error51?.code ? { code: error51.code } : {},
+      ...error51?.operationId ? { operationId: error51.operationId } : {}
+    });
   }
 });
 function sendLocalCommand(name, input, timeoutMs = 3e4) {
@@ -31633,6 +31829,28 @@ function sendLocalCommand(name, input, timeoutMs = 3e4) {
   completePoll(session);
   return result;
 }
+function connectedSession() {
+  const liveSessions = activeSessions();
+  if (liveSessions.length === 0) {
+    throw new Error("No Figma plugin is connected. Open Local MCP Bridge in the target Figma file and leave its status panel open; it connects automatically.");
+  }
+  if (liveSessions.length > 1) {
+    throw new Error("More than one Figma plugin is connected. Keep only the target file's bridge plugin connected.");
+  }
+  return liveSessions[0];
+}
+async function sendTrackedLocalCommand(name, input, options = {}) {
+  const session = connectedSession();
+  if (!session.info?.capabilities?.includes(compositionImageCapability)) {
+    const error51 = new Error("The connected Figma plugin does not support tracked composition image verification. Reload the updated Local MCP Bridge development plugin in Figma before composing.");
+    error51.code = "PLUGIN_UPDATE_REQUIRED";
+    throw error51;
+  }
+  const { operation } = createTrackedOperation(session, name, input, options.operationId);
+  if (options.waitForCompletion === false) return operationSnapshot(operation, false);
+  const result = await waitForOperation(operation, options.timeoutMs ?? 3e5);
+  return result && typeof result === "object" && !Array.isArray(result) ? { operationId: operation.id, ...result } : { operationId: operation.id, result };
+}
 async function ownerRequest(pathname, options = {}, timeoutMs = 5e3) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -31648,7 +31866,10 @@ async function ownerRequest(pathname, options = {}, timeoutMs = 5e3) {
       }
     }
     if (!response.ok) {
-      throw new Error(typeof data.error === "string" ? data.error : `Bridge owner returned HTTP ${response.status} for ${pathname}.`);
+      const error51 = new Error(typeof data.error === "string" ? data.error : `Bridge owner returned HTTP ${response.status} for ${pathname}.`);
+      if (data.code) error51.code = data.code;
+      if (data.operationId) error51.operationId = data.operationId;
+      throw error51;
     }
     return data;
   } catch (error51) {
@@ -31685,6 +31906,44 @@ async function sendCommand(name, input, timeoutMs = 3e4) {
     body: JSON.stringify({ name, input, timeoutMs })
   }, timeoutMs + 5e3);
   return response.result;
+}
+async function sendTrackedCommand(name, input, options = {}) {
+  await initialBridgeRole;
+  if (bridgeRole === "owner") return sendTrackedLocalCommand(name, input, options);
+  await requireTrackedOwner();
+  const timeoutMs = options.timeoutMs ?? 3e5;
+  const response = await ownerRequest("/v1/mcp-command", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      name,
+      input,
+      timeoutMs,
+      tracked: true,
+      operationId: options.operationId,
+      waitForCompletion: options.waitForCompletion !== false
+    })
+  }, options.waitForCompletion === false ? 1e4 : timeoutMs + 5e3);
+  return response.result;
+}
+async function operationStatusForMcp(operationId, includeResult) {
+  await initialBridgeRole;
+  if (bridgeRole === "owner") return operationSnapshot(getOperation(operationId), includeResult);
+  await requireTrackedOwner();
+  const response = await ownerRequest("/v1/mcp-operation-status", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ operationId, includeResult })
+  });
+  return response.operation;
+}
+async function requireTrackedOwner() {
+  const status = await ownerRequest("/v1/status");
+  if (!status.bridge?.capabilities?.includes(trackedCompositionCapability)) {
+    const error51 = new Error("The running bridge owner does not support tracked compositions. Restart the MCP bridge processes using the updated build before composing; no command was sent.");
+    error51.code = "BRIDGE_UPDATE_REQUIRED";
+    throw error51;
+  }
 }
 function output(data) {
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
@@ -31868,7 +32127,7 @@ async function localizeBatchExports(data) {
   return {
     ...data,
     exports,
-    verificationComplete: data.audits?.every((item) => !item.error) !== false && exports.every((item) => !item.error)
+    verificationComplete: data.verificationComplete !== false && data.audits?.every((item) => !item.error) !== false && (data.imageAudit?.warningCount ?? 0) === 0 && exports.every((item) => !item.error)
   };
 }
 function failure(error51) {
@@ -31880,12 +32139,18 @@ function structuredFailure(code, error51, details = {}) {
     isError: true
   };
 }
-function requireCompositionResult(data, requestedElementCount) {
+function requireCompositionResult(data, requestedElementCount, requiredImageCount) {
   const createdCount = Array.isArray(data?.createdNodeIds) ? data.createdNodeIds.length : 0;
   const elementCount = Array.isArray(data?.elements) ? data.elements.length : 0;
   if (!data?.frame?.id || createdCount !== requestedElementCount + 1 || elementCount !== requestedElementCount) {
     const error51 = new Error(`Figma returned an incomplete composition: expected one root frame and ${requestedElementCount} native elements, received ${createdCount} created node IDs and ${elementCount} element records.`);
     error51.code = "COMPOSITION_EMPTY_OR_INCOMPLETE";
+    throw error51;
+  }
+  const audit = data.imageAudit;
+  if (!audit || !Number.isSafeInteger(audit.requiredCount) || audit.requiredCount < 0 || !Number.isSafeInteger(audit.filledCount) || audit.filledCount < 0 || audit.filledCount > audit.requiredCount || !Number.isSafeInteger(audit.warningCount) || audit.warningCount < 0 || !Array.isArray(audit.warnings) || audit.warningCount !== audit.warnings.length || audit.warningCount !== audit.requiredCount - audit.filledCount || requiredImageCount !== void 0 && audit.requiredCount !== requiredImageCount || audit.warningCount > 0 && (data.verificationComplete !== false || data.archived)) {
+    const error51 = new Error("Figma returned missing or inconsistent required-image audit evidence.");
+    error51.code = "COMPOSITION_IMAGE_AUDIT_INVALID";
     throw error51;
   }
   return data;
@@ -31929,6 +32194,12 @@ var styledSpan = external_exports.object({
   ...textStyleFields
 }).refine((span) => span.end > span.start, "Styled span end must be greater than start.");
 var imageTransform = external_exports.array(external_exports.tuple([external_exports.number().finite(), external_exports.number().finite(), external_exports.number().finite()])).length(2);
+var composeImageFields = {
+  imageSourceNodeId: nodeId.optional().describe("Existing Figma node whose image fill should be copied directly into this composed element."),
+  imageScaleMode: external_exports.enum(["FILL", "FIT", "CROP", "TILE"]).optional(),
+  imageTransform: imageTransform.optional().describe("Optional Figma 2\xD73 crop transform; requires imageSourceNodeId and forces CROP mode."),
+  imageRequired: external_exports.boolean().default(false).describe("Mark this as a required image area. Verification remains incomplete if it has no image fill.")
+};
 var composeFrameElement = external_exports.discriminatedUnion("type", [
   external_exports.object({
     type: external_exports.literal("frame"),
@@ -31941,7 +32212,8 @@ var composeFrameElement = external_exports.discriminatedUnion("type", [
     layout: external_exports.enum(["none", "horizontal", "vertical"]).default("none"),
     itemSpacing: external_exports.number().finite().min(0).max(1e3).default(0),
     padding: external_exports.number().finite().min(0).max(1e3).default(0),
-    ...visualStyle
+    ...visualStyle,
+    ...composeImageFields
   }),
   external_exports.object({
     type: external_exports.literal("rectangle"),
@@ -31951,7 +32223,8 @@ var composeFrameElement = external_exports.discriminatedUnion("type", [
     width: external_exports.number().finite().min(1).max(1e4),
     height: external_exports.number().finite().min(1).max(1e4),
     ...position,
-    ...visualStyle
+    ...visualStyle,
+    ...composeImageFields
   }),
   external_exports.object({
     type: external_exports.literal("text"),
@@ -32476,7 +32749,9 @@ var workflowInstructions = [
   "Only create, update, delete or revert a stored preference after an explicit user instruction or confirmation. Never silently learn a preference from one document.",
   "Before creating or replacing text, separate content from presentation. Author generated headings, labels and buttons in natural case; display uppercase, lowercase, title case or small caps with textCase or figma_set_text_case.",
   "Never pass all-caps characters merely to make text look uppercase. Preserve exact all-caps characters only when they are semantically intended, supplied as authoritative copy, or explicitly requested by the user.",
-  "For a page re-layout: inspect and export the current artboard, list page tokens or copy style from verified source nodes, compose the named replacement with figma_compose_frame, archive explicit previous sibling nodes only after the replacement succeeds, then inspect the returned audit and PNG.",
+  "For a page re-layout: inspect and export the current artboard, list page tokens or copy style from verified source nodes, then compose the named replacement. Use figma_start_composition plus figma_operation_status for a potentially slow board; use figma_compose_frame only when a blocking call is suitable.",
+  "Reuse approved existing image fills inside compositions with imageSourceNodeId. Mark necessary image areas imageRequired=true, inspect imageAudit, and never call the board complete or archive its predecessor while required images are missing.",
+  "If a tracked composition is interrupted or times out, call figma_operation_status with its operation ID before retrying. Reuse that ID to recover the same request; do not start a duplicate while it is queued, running, or has an unknown outcome.",
   "For a reference board or new canvas area: call figma_inspect_canvas_layout first, create a native SECTION with figma_create_section, and compose native frames inside it. Re-check the created node for collisions and use a targeted screenshot when visual overlap or adjacency matters.",
   "Never use figma_import_svg for UI layouts, panels, boards, or editable labels. Reserve it for approved logos, icons, and isolated vector artwork; create UI text in natural case and apply Figma textCase for visual casing.",
   "Treat COMPOSITION_EMPTY_OR_INCOMPLETE, any structured composition error, or a blank result as a hard stop. Do not fall back to SVG layout construction.",
@@ -32494,6 +32769,20 @@ server.registerTool("figma_bridge_status", {
 }, async () => {
   try {
     return output(await bridgeStatusForMcp());
+  } catch (error51) {
+    return failure(error51);
+  }
+});
+server.registerTool("figma_operation_status", {
+  title: "Check a tracked Figma operation",
+  description: "Read the state, latest progress, error, or completed result for a long-running Figma operation. Always check a timed-out or still-running operation before retrying it.",
+  inputSchema: {
+    operationId: external_exports.string().uuid(),
+    includeResult: external_exports.boolean().default(true)
+  }
+}, async (input) => {
+  try {
+    return output(await operationStatusForMcp(input.operationId, input.includeResult));
   } catch (error51) {
     return failure(error51);
   }
@@ -33002,37 +33291,56 @@ server.registerTool("figma_supersede_layout", {
     return failure(error51);
   }
 });
+var compositionInputSchema = {
+  operationId: external_exports.string().uuid().optional().describe("Optional idempotency key. Reuse the same ID to resume or recover the same composition instead of creating a duplicate."),
+  frame: external_exports.object({
+    name: external_exports.string().trim().min(1).max(200),
+    width: external_exports.number().finite().min(1).max(1e4),
+    height: external_exports.number().finite().min(1).max(1e4),
+    ...position,
+    parentId: nodeId.optional().describe("Optional native section or frame parent for the composed root frame."),
+    layout: external_exports.enum(["none", "horizontal", "vertical"]).default("none"),
+    itemSpacing: external_exports.number().finite().min(0).max(1e3).default(0),
+    padding: external_exports.number().finite().min(0).max(1e3).default(0),
+    ...visualStyle
+  }),
+  elements: external_exports.array(composeFrameElement).min(1).max(100),
+  archiveNodeIds: external_exports.array(nodeId).max(100).default([]),
+  archiveName: external_exports.string().trim().min(1).max(200).default("Previous layout"),
+  archiveReason: external_exports.string().trim().min(1).max(500).default("Superseded by composed layout"),
+  audit: external_exports.boolean().default(true),
+  export: external_exports.boolean().default(true),
+  maxDimension: external_exports.number().int().min(128).max(8192).default(4096),
+  scale: external_exports.number().finite().min(0.1).max(4).default(2),
+  collisionPolicy: collisionPolicy.default("reject").describe("Reject sibling overlap by default. Use report only for an intentional overlap; ignore suppresses the guard.")
+};
+function compositionCommandInput(input) {
+  const { operationId, ...commandInput } = input;
+  return { operationId, commandInput };
+}
 server.registerTool("figma_compose_frame", {
   title: "Compose and verify a Figma frame",
-  description: "Create one frame plus ordered panels, dividers, and styled-span text in a single guarded plugin command. On failure every newly created node is removed. Optionally archive previous sibling nodes only after composition succeeds, then audit and export the replacement.",
-  inputSchema: {
-    frame: external_exports.object({
-      name: external_exports.string().trim().min(1).max(200),
-      width: external_exports.number().finite().min(1).max(1e4),
-      height: external_exports.number().finite().min(1).max(1e4),
-      ...position,
-      parentId: nodeId.optional().describe("Optional native section or frame parent for the composed root frame."),
-      layout: external_exports.enum(["none", "horizontal", "vertical"]).default("none"),
-      itemSpacing: external_exports.number().finite().min(0).max(1e3).default(0),
-      padding: external_exports.number().finite().min(0).max(1e3).default(0),
-      ...visualStyle
-    }),
-    elements: external_exports.array(composeFrameElement).min(1).max(100),
-    archiveNodeIds: external_exports.array(nodeId).max(100).default([]),
-    archiveName: external_exports.string().trim().min(1).max(200).default("Previous layout"),
-    archiveReason: external_exports.string().trim().min(1).max(500).default("Superseded by composed layout"),
-    audit: external_exports.boolean().default(true),
-    export: external_exports.boolean().default(true),
-    maxDimension: external_exports.number().int().min(128).max(8192).default(4096),
-    scale: external_exports.number().finite().min(0.1).max(4).default(2),
-    collisionPolicy: collisionPolicy.default("reject").describe("Reject sibling overlap by default. Use report only for an intentional overlap; ignore suppresses the guard.")
-  }
+  description: "Create one frame plus ordered native panels, image-filled areas, dividers, and styled-span text in one tracked command. Required image areas participate in verification, and previous nodes are archived only after verification succeeds. For proactive progress polling, use figma_start_composition.",
+  inputSchema: compositionInputSchema
 }, async (input) => {
+  const { operationId, commandInput } = compositionCommandInput(input);
   try {
-    const result = requireCompositionResult(await sendCommand("composeFrame", input, 3e5), input.elements.length);
-    return output(await localizeBatchExports(result));
+    const result = requireCompositionResult(await sendTrackedCommand("composeFrame", commandInput, { operationId, waitForCompletion: true, timeoutMs: 3e5 }), input.elements.length);
+    return output(result);
   } catch (error51) {
-    return structuredFailure(error51?.code ?? "COMPOSITION_FAILED", error51, { requestedElementCount: input.elements.length });
+    return structuredFailure(error51?.code ?? "COMPOSITION_FAILED", error51, { requestedElementCount: input.elements.length, ...error51?.operationId ? { operationId: error51.operationId } : {} });
+  }
+});
+server.registerTool("figma_start_composition", {
+  title: "Start a tracked Figma composition",
+  description: "Start a long native-frame composition and return immediately with an operation ID. Poll figma_operation_status for phase, percentage, warnings, and the final result; reuse the same operationId rather than starting a duplicate.",
+  inputSchema: compositionInputSchema
+}, async (input) => {
+  const { operationId, commandInput } = compositionCommandInput(input);
+  try {
+    return output(await sendTrackedCommand("composeFrame", commandInput, { operationId, waitForCompletion: false, timeoutMs: 3e5 }));
+  } catch (error51) {
+    return structuredFailure(error51?.code ?? "COMPOSITION_START_FAILED", error51, { requestedElementCount: input.elements.length });
   }
 });
 server.registerTool("figma_copy_style_from_node", {

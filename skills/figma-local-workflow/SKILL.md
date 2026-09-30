@@ -88,7 +88,9 @@ Use this flow only after the user identifies which source is authoritative and t
 
 ### Timeout recovery
 
-If a mutation batch times out, do not retry it immediately. Reconnect the plugin if needed, then re-read the affected visible text and determine which updates landed. Apply only the remaining changes with fresh `expectedText` guards. Do not create an alternate frame, hide the old one or issue a second blind batch to recover.
+For a tracked composition, keep its operation ID and call `figma_operation_status` after interruption or caller timeout. If it is queued or running, wait; if it succeeded, use the returned result; if it failed, diagnose that error. Reuse the same operation ID to resume the request and never start a duplicate while its outcome remains available or unknown.
+
+For an untracked mutation batch, do not retry immediately. Reconnect the plugin if needed, then re-read the affected visible text and determine which updates landed. Apply only the remaining changes with fresh `expectedText` guards. Do not create an alternate frame, hide the old one or issue a second blind batch to recover.
 
 ## Re-layout a page recipe
 
@@ -96,16 +98,17 @@ Use this deterministic flow when replacing an existing brochure page or artboard
 
 1. Confirm the bridge/page, list artboards, read the exact target with `detail: summary`, and export its current PNG before changing anything.
 2. Use `figma_list_design_system_assets` and `figma_list_page_tokens` to discover verified components, variables, styles, colours, and fonts. Prefer an appropriate component instance or named style; use `figma_copy_style_from_node` when a known source node is the clearest brand reference. Never approximate a value already present in the file.
-3. Define one clearly named replacement frame. Call `figma_compose_frame` with ordered frame/rectangle/text elements; use styled spans for mixed emphasis inside one text layer. Keep keys unique and declare parent elements before their children.
-4. Prefer supplying explicit previous sibling IDs in `archiveNodeIds`. The composer must build successfully before it groups those nodes into the hidden named archive. If composition and archiving are separate, verify the replacement first, then call `figma_supersede_layout` or `figma_archive_nodes` with the replacement ID.
-5. Inspect the compact audit and local PNG returned by the composer. If verification is incomplete, preserve the previous layout and diagnose before retrying. Use a full read only when the summary lacks necessary hierarchy.
-6. Re-read the replacement in summary mode and confirm the archive name/replacement relationship. Do not delete the archived group unless the user later identifies it for permanent removal.
+3. Define one clearly named replacement frame. Use `figma_start_composition` for a potentially slow board, then poll `figma_operation_status`; use `figma_compose_frame` directly only when a blocking call is appropriate. Keep keys unique and declare parent elements before their children.
+4. Build ordered native frame/rectangle/text elements and use styled spans for mixed emphasis. For an approved image already in Figma, set `imageSourceNodeId` on its composed frame or rectangle instead of duplicating and reparenting nodes. Set `imageRequired: true` wherever an image is necessary to call the board complete.
+5. Prefer supplying explicit previous sibling IDs in `archiveNodeIds`. The composer archives them only after text/export/image verification succeeds. If verification is incomplete, inspect `imageAudit`, preserve the previous layout, and fix the replacement before retrying or archiving separately.
+6. Inspect the compact audits and local PNG returned by the composer. Use a full read only when the summary lacks necessary hierarchy.
+7. Re-read the replacement in summary mode and confirm the archive name/replacement relationship. Do not delete the archived group unless the user later identifies it for permanent removal.
 
 ## Reference-board recipe
 
 1. Call `figma_inspect_canvas_layout` without a target to read native sections and the occupied top-level canvas envelope. Figma pages are unbounded; do not mistake that envelope for a page boundary.
 2. Collision-check the proposed section rectangle. Create it with `figma_create_section` only when the result is clear, or when the user explicitly accepts an intentional overlap.
-3. Use `figma_compose_frame` with the new section ID as `frame.parentId`. Build panels from native frames/components and labels from editable natural-case Figma text with `textCase` styling.
+3. Compose with the new section ID as `frame.parentId`; use `figma_start_composition` plus status polling when the board may be slow. Build panels from native frames/components and labels from editable natural-case Figma text with `textCase` styling.
 4. Treat a blank response, `COMPOSITION_EMPTY_OR_INCOMPLETE`, or any other composition failure as a hard stop. Inspect and retry the native path; never switch to an SVG layout workaround.
 5. Call `figma_inspect_canvas_layout` with the created node ID to verify sibling collisions. Use a targeted screenshot when adjacency or visual overlap still requires judgement.
 
@@ -124,7 +127,8 @@ Use this deterministic flow when replacing an existing brochure page or artboard
 - Make small, reversible batches and verify each batch before continuing.
 - For copy-only work, overwrite the existing visible text layers. Do not create duplicate layouts, hide existing layers, or reduce old nodes to zero opacity. Use replacement/archival only for an explicitly requested layout change, and state the result clearly.
 - Prefer `figma_archive_nodes` or `figma_supersede_layout` over opacity-zero superseded layers. Archive only explicit siblings and always record the replacement when one exists.
-- Use `figma_compose_frame` for bounded page composition that would otherwise require many serial creation calls. Treat its audit and exported PNG as required verification, not optional decoration.
+- Use `figma_start_composition` plus `figma_operation_status` for a potentially slow board. Use `figma_compose_frame` for a bounded composition that is expected to finish within the blocking call. Treat text, export, and required-image audits as completion evidence.
+- Reuse an existing approved Figma image with a composed element's `imageSourceNodeId`. Mark visually necessary image areas with `imageRequired: true`; never call a board finished or archive its predecessor while `imageAudit.warningCount` is non-zero.
 - Before placing a new section or top-level frame, inspect canvas bounds and collision-check the proposed rectangle. After placement, collision-check the actual node and visually inspect any uncertain adjacency; coordinate assumptions alone are not verification.
 - Use `figma_place_local_image` only for an absolute local image path the user explicitly placed in scope or an HTTPS image URL the user explicitly approved. URL fetches are limited to public IP destinations, revalidated across at most five redirects, capped at 25 MB, and checked by image signature. Prefer `figma_copy_image_fill` when an approved image already exists in Figma.
 - Delete only a clearly stray element that the user identified. Otherwise preserve it, including superseded or hidden elements.

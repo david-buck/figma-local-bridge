@@ -366,7 +366,7 @@ test("compose frame removes the entire new subtree when a later element fails", 
   assert.equal(page.children.length, 0);
 });
 
-test("compose frame can build native panels inside a section with root auto-layout", async () => {
+test("compose frame builds native panels with direct image fills and audits required image areas", async () => {
   const { composeFrame, figma } = await loadPluginHelpers();
   const section = {
     id: "7:1", name: "Reference board", type: "SECTION", x: 100, y: 100, width: 800, height: 600, visible: true, opacity: 1, children: [],
@@ -377,7 +377,8 @@ test("compose frame can build native panels inside a section with root auto-layo
       this.children.push(child);
     },
   };
-  const page = configurePage(figma, [section]);
+  const sourceImage = { id: "7:image", name: "Approved image", type: "RECTANGLE", x: 1_000, y: 0, width: 100, height: 100, visible: true, opacity: 1, fills: [{ type: "IMAGE", imageHash: "hash-1", scaleMode: "FILL" }], strokes: [], children: [] };
+  const page = configurePage(figma, [section, sourceImage]);
   let nextId = 2;
   figma.createFrame = () => {
     const node = {
@@ -394,11 +395,25 @@ test("compose frame can build native panels inside a section with root auto-layo
     page.appendChild(node);
     return node;
   };
+  figma.createRectangle = () => {
+    const node = {
+      id: `7:${nextId++}`, name: "", type: "RECTANGLE", x: 0, y: 0, width: 100, height: 100, visible: true, opacity: 1, fills: [], strokes: [], children: [], removed: false,
+      resize(width, height) { this.width = width; this.height = height; },
+      remove() { this.removed = true; const index = this.parent?.children?.indexOf(this) ?? -1; if (index >= 0) this.parent.children.splice(index, 1); },
+    };
+    page.appendChild(node);
+    return node;
+  };
+  const progress = [];
   const result = await composeFrame({
     frame: { name: "Native board", parentId: section.id, width: 500, height: 400, x: 20, y: 30, layout: "vertical", itemSpacing: 16, padding: 24 },
-    elements: [{ type: "frame", key: "panel", name: "Panel", width: 452, height: 100, x: 0, y: 0, layout: "none", itemSpacing: 0, padding: 0 }],
+    elements: [
+      { type: "frame", key: "panel", name: "Panel", width: 452, height: 100, x: 0, y: 0, layout: "none", itemSpacing: 0, padding: 0 },
+      { type: "rectangle", key: "photo", parentKey: "panel", name: "Photo", width: 200, height: 80, x: 0, y: 0, imageSourceNodeId: sourceImage.id, imageScaleMode: "FIT", imageRequired: true },
+      { type: "rectangle", key: "missing-photo", parentKey: "panel", name: "Missing photo", width: 200, height: 80, x: 220, y: 0, imageRequired: true },
+    ],
     archiveNodeIds: [], collisionPolicy: "reject", audit: false, export: false,
-  });
+  }, async (update) => { progress.push(update); });
   assert.equal(result.ok, true);
   assert.equal(result.frame.parent.id, section.id);
   assert.equal(section.children[0].layoutMode, "VERTICAL");
@@ -406,6 +421,14 @@ test("compose frame can build native panels inside a section with root auto-layo
   assert.equal(section.children[0].paddingTop, 24);
   assert.equal(result.elements[0].type, "FRAME");
   assert.equal(result.placement.clear, true);
+  const photo = section.children[0].children[0].children[0];
+  assert.equal(photo.fills[0].imageHash, "hash-1");
+  assert.equal(photo.fills[0].scaleMode, "FIT");
+  assert.equal(result.imageAudit.requiredCount, 2);
+  assert.equal(result.imageAudit.filledCount, 1);
+  assert.equal(result.imageAudit.warningCount, 1);
+  assert.equal(result.verificationComplete, false);
+  assert.deepEqual(progress.map((update) => update.phase), ["preflight", "root", "elements", "elements", "elements", "image-audit", "complete"]);
 });
 
 test("canvas layout reports sections, occupied bounds, and proposed sibling collisions", async () => {
@@ -608,6 +631,33 @@ test("composition archives originals only after verification and preserves repla
   assert.equal(result.archived.replacementNodeId, result.frame.id);
   assert.equal(archive.data["figma_local_bridge.replacementNodeId"], result.frame.id);
   assert.equal(page.children.find((node) => node.id === result.frame.id).removed, false);
+});
+
+test("composition preserves originals when a required image area is empty", async () => {
+  const { composeFrame, figma } = await loadPluginHelpers();
+  const { page, first, second, input } = compositionFixture(figma);
+  input.elements = [{ type: "frame", key: "photo", name: "Required photo", width: 80, height: 80, x: 0, y: 0, layout: "none", itemSpacing: 0, padding: 0, imageRequired: true }];
+  const result = await composeFrame(input);
+  assert.equal(result.verificationComplete, false);
+  assert.equal(result.imageAudit.warningCount, 1);
+  assert.deepEqual(Array.from(result.archiveSkipped.nodeIds), [first.id, second.id]);
+  assert.equal(page.children.some((node) => node.type === "GROUP"), false);
+  assert.equal(first.parent, page);
+  assert.equal(second.parent, page);
+});
+
+test("a final progress connection failure preserves the committed layout and archive", async () => {
+  const { composeFrame, figma } = await loadPluginHelpers();
+  const { page, first, second, input } = compositionFixture(figma);
+  const result = await composeFrame(input, async ({ phase }) => {
+    if (phase === "complete") { const error = new Error("Session replaced"); error.status = 409; throw error; }
+  });
+  const replacement = page.children.find((node) => node.id === result.frame.id);
+  const archive = page.children.find((node) => node.type === "GROUP");
+  assert.equal(replacement.removed, false);
+  assert.equal(archive.visible, false);
+  assert.deepEqual(archive.children, [first, second]);
+  assert.equal(archive.data["figma_local_bridge.replacementNodeId"], replacement.id);
 });
 
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.14.0 — 2026-10-01
+
+- Added tracked compositions with retained operation IDs, phase/percentage updates, idempotent resume, and `figma_operation_status`. A caller timeout no longer discards a later composition result.
+- Added `figma_start_composition` for non-blocking board creation. The plugin status panel now shows composition progress while Figma works.
+- Composed frames and rectangles can copy an existing image fill directly with `imageSourceNodeId`, including scale mode and crop transform controls.
+- Added `imageRequired` and a structured image audit. Empty required image areas leave `verificationComplete` false and preserve any previous layout instead of archiving it.
+- Composition checks plugin and bridge-owner capabilities before dispatch, preventing older processes from bypassing image verification or operation tracking. Missing or inconsistent completion evidence requires document inspection.
+- A lost final progress update preserves the committed replacement and archive. Session replacement cancels queued work and marks dispatched work as unknown until the document is inspected.
+
 ## 0.13.4 — 2026-09-30
 
 - `figma_place_local_image` now accepts an approved HTTPS image URL as well as an absolute local image path. Provide exactly one source; PNG, JPEG, GIF, and WebP remain supported.
