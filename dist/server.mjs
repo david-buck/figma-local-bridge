@@ -33169,7 +33169,7 @@ server.registerTool("figma_set_selection", {
 });
 server.registerTool("figma_move_resize_reparent", {
   title: "Move, resize, or reparent a Figma node",
-  description: "Update an existing current-page node's x/y position, dimensions, and/or parent. Coordinates are relative to the resulting parent. Reparenting can be rejected by Figma for protected structures such as instance children.",
+  description: "Update an existing current-page node's x/y position, dimensions, and/or parent. Coordinates are relative to the resulting parent. If a CROP image fill is resized to a different aspect ratio, it switches to centered FILL so the image stays undistorted; the result reports this adjustment. Reparenting can be rejected by Figma for protected structures such as instance children.",
   inputSchema: external_exports.object({
     nodeId,
     parentId: nodeId.optional().describe("Optional new current-page parent ID."),

@@ -1694,11 +1694,44 @@ async function execute(name, input, reportProgress = async () => {}) {
       if (!("resize" in node)) throw new Error("The target node cannot be resized.");
     }
     if (parent && node.parent !== parent) parent.appendChild(node);
-    if (input.width !== undefined || input.height !== undefined) node.resize(input.width ?? node.width, input.height ?? node.height);
+    const imageResizeAdjustments = [];
+    if (input.width !== undefined || input.height !== undefined) {
+      const nextWidth = input.width ?? node.width;
+      const nextHeight = input.height ?? node.height;
+      // Compare relative proportions so very narrow/tall images use the same tolerance.
+      const horizontal = nextWidth * node.height;
+      const vertical = nextHeight * node.width;
+      const aspectChanged = Math.abs(horizontal - vertical) > 1e-6 * Math.max(Math.abs(horizontal), Math.abs(vertical));
+      const fills = "fills" in node && node.fills !== figma.mixed ? node.fills : null;
+      const resetCropFills = aspectChanged && fills?.some((paint) => paint.type === "IMAGE" && paint.scaleMode === "CROP");
+      const originalFills = resetCropFills ? cloneValue(fills) : null;
+
+      if (resetCropFills) {
+        const safeFills = cloneValue(fills);
+        for (let index = 0; index < safeFills.length; index += 1) {
+          const paint = safeFills[index];
+          if (paint.type !== "IMAGE" || paint.scaleMode !== "CROP") continue;
+          safeFills[index] = { ...paint, scaleMode: "FILL" };
+          delete safeFills[index].imageTransform;
+          imageResizeAdjustments.push({ fillIndex: index, from: "CROP", to: "FILL", reason: "aspect-ratio-changed" });
+        }
+        await node.setFillsAsync(safeFills);
+      }
+
+      try {
+        node.resize(nextWidth, nextHeight);
+      } catch (error) {
+        if (originalFills) {
+          try { await node.setFillsAsync(originalFills); }
+          catch (_) { throw new Error(`Resize failed, and the original crop fill on node ${node.id} could not be restored. Inspect the node before retrying.`); }
+        }
+        throw error;
+      }
+    }
     if (input.x !== undefined) node.x = input.x;
     if (input.y !== undefined) node.y = input.y;
     focus(node);
-    return { mutatedNodeIds: [node.id], node: serializeNode(node) };
+    return { mutatedNodeIds: [node.id], node: serializeNode(node), imageResizeAdjustments };
   }
 
   if (name === "readText") {

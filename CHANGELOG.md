@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Resizing a CROP-filled node to a different aspect ratio switches that image fill to centered FILL before resizing, preventing image distortion; the resize result reports the adjustment.
+- Crop correction supports mixed image/pattern fill stacks and detects proportional changes in very narrow or tall images. Failed resizes restore the original fills; custom crop positions are reset on successful aspect changes.
+- Added regression coverage for crop correction, proportional resizing, mixed fills, and failure recovery.
+
 ## 0.14.0 — 2026-10-01
 
 - Added tracked compositions with retained operation IDs, phase/percentage updates, idempotent resume, and `figma_operation_status`. A caller timeout no longer discards a later composition result.

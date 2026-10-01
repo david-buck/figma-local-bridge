@@ -28,6 +28,77 @@ async function loadPluginHelpers() {
   return context.__pluginTests;
 }
 
+function cropResizeFixture(figma, { width = 200, height = 100, pattern = false, failResize = false, failRestore = false } = {}) {
+  let fills = [{ type: "IMAGE", imageHash: "approved-image", scaleMode: "CROP", opacity: 0.8, imageTransform: [[1, 0, 0.2], [0, 1, 0.1]] }];
+  if (pattern) fills.push({ type: "PATTERN", sourceNodeId: "source" });
+  const originalFills = JSON.parse(JSON.stringify(fills));
+  const writes = [];
+  const node = {
+    id: "photo", name: "Photo", type: "RECTANGLE", x: 0, y: 0, width, height, visible: true,
+    get fills() { return fills; },
+    set fills(_) { throw new Error("Use the async setter for this fill stack"); },
+    async setFillsAsync(value) {
+      await Promise.resolve();
+      if (failRestore && writes.length > 0) throw new Error("Restore rejected");
+      fills = JSON.parse(JSON.stringify(value));
+      writes.push(fills);
+    },
+    resize(nextWidth, nextHeight) {
+      if (failResize) throw new Error("Resize rejected");
+      this.width = nextWidth; this.height = nextHeight;
+    },
+  };
+  configurePage(figma, [node]);
+  return { node, writes, originalFills };
+}
+
+for (const dimensions of [
+  { name: "ordinary image", width: 200, height: 100, nextWidth: 100, nextHeight: 100 },
+  { name: "very narrow image", width: 1, height: 100000, nextWidth: 1, nextHeight: 95000 },
+  { name: "very tall-aspect change", width: 100000, height: 1, nextWidth: 95000, nextHeight: 1 },
+]) {
+  test(`aspect-changing resize corrects crop for ${dimensions.name} and preserves pattern fills`, async () => {
+    const { execute, figma } = await loadPluginHelpers();
+    const { node, writes, originalFills } = cropResizeFixture(figma, { ...dimensions, pattern: true });
+    const result = await execute("moveResizeReparent", { nodeId: node.id, width: dimensions.nextWidth, height: dimensions.nextHeight });
+    assert.equal(node.width, dimensions.nextWidth);
+    assert.equal(node.height, dimensions.nextHeight);
+    assert.equal(node.fills[0].scaleMode, "FILL");
+    assert.equal(node.fills[0].imageTransform, undefined);
+    assert.equal(node.fills[0].imageHash, "approved-image");
+    assert.equal(node.fills[0].opacity, 0.8);
+    assert.deepEqual(node.fills[1], originalFills[1]);
+    assert.equal(writes.length, 1);
+    assert.equal(result.imageResizeAdjustments[0].reason, "aspect-ratio-changed");
+  });
+}
+
+for (const input of [{ width: 400, height: 200 }, { x: 50, y: 60 }]) {
+  test(`proportional resize or movement keeps custom crop: ${JSON.stringify(input)}`, async () => {
+    const { execute, figma } = await loadPluginHelpers();
+    const { node, writes, originalFills } = cropResizeFixture(figma);
+    const result = await execute("moveResizeReparent", { nodeId: node.id, ...input });
+    assert.deepEqual(node.fills, originalFills);
+    assert.equal(writes.length, 0);
+    assert.equal(result.imageResizeAdjustments.length, 0);
+  });
+}
+
+test("resize failure restores custom crop and mixed pattern fills asynchronously", async () => {
+  const { execute, figma } = await loadPluginHelpers();
+  const { node, writes, originalFills } = cropResizeFixture(figma, { pattern: true, failResize: true });
+  await assert.rejects(execute("moveResizeReparent", { nodeId: node.id, width: 100 }), /Resize rejected/);
+  assert.deepEqual(node.fills, originalFills);
+  assert.equal(writes.length, 2);
+  assert.equal(node.width, 200);
+});
+
+test("failed crop restoration explicitly requires inspecting the node", async () => {
+  const { execute, figma } = await loadPluginHelpers();
+  const { node } = cropResizeFixture(figma, { failResize: true, failRestore: true });
+  await assert.rejects(execute("moveResizeReparent", { nodeId: node.id, width: 100 }), /original crop fill.*could not be restored.*Inspect/);
+});
+
 test("poll query is encoded without browser-only URLSearchParams", async () => {
   const helpers = await loadPluginHelpers();
   helpers.figma.currentPage.name = "Brochure frames & copy / Māori";
