@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.14.1 — 2026-10-01
 
 - Resizing a CROP-filled node to a different aspect ratio switches that image fill to centered FILL before resizing, preventing image distortion; the resize result reports the adjustment.
 - Crop correction supports mixed image/pattern fill stacks and detects proportional changes in very narrow or tall images. Failed resizes restore the original fills; custom crop positions are reset on successful aspect changes.
